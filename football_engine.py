@@ -2287,3 +2287,848 @@ class FootballMatch:
         angle_quality = (
             1
             - abs(player.y - 30)
+            / 40
+        )
+
+        pressure = self._pressure_on_player(
+            player
+        )
+
+        quality = (
+            player.shooting * 0.55
+            + player.composure * 0.20
+            + player.balance * 0.10
+            + angle_quality * 15
+            - pressure * 12
+        )
+
+        quality = clamp(
+            quality,
+            20,
+            100,
+        )
+
+        # Shots are intentionally difficult to turn into goals.
+        # This prevents the previous "everyone is Haaland"
+        # simulation problem.
+        goal_probability = (
+            0.025
+            + quality / 1000
+        )
+
+        distance_factor = clamp(
+            1
+            - (goal_distance - 8) / 70,
+            0.25,
+            1.0,
+        )
+
+        goal_probability *= distance_factor
+
+        if player.position.upper() in {
+            "ST",
+            "CF",
+        }:
+            goal_probability *= 1.18
+
+        if player.position.upper() in {
+            "CB",
+            "LCB",
+            "RCB",
+        }:
+            goal_probability *= 0.55
+
+        goal_probability = clamp(
+            goal_probability,
+            0.01,
+            0.22,
+        )
+
+        on_target_probability = clamp(
+            0.28
+            + player.shooting / 180
+            + player.composure / 400
+            - pressure * 0.08,
+            0.22,
+            0.78,
+        )
+
+        self._event(
+            "shot",
+            team=player.side,
+            player=player.id,
+            distance=round(
+                goal_distance,
+                1,
+            ),
+        )
+
+        if random.random() < goal_probability:
+
+            player.shots_on_target += 1
+
+            self.stats[
+                "shotsOnTarget"
+            ][player.side] += 1
+
+            self._team(
+                player.side
+            ).stats[
+                "shotsOnTarget"
+            ] += 1
+
+            self._goal(
+                player.side,
+                scorer=player,
+            )
+
+            return
+
+        if random.random() < on_target_probability:
+
+            player.shots_on_target += 1
+
+            self.stats[
+                "shotsOnTarget"
+            ][player.side] += 1
+
+            self._team(
+                player.side
+            ).stats[
+                "shotsOnTarget"
+            ] += 1
+
+            goalkeeper = self._team(
+                self._other_side(
+                    player.side
+                )
+            ).goalkeeper()
+
+            save_power = (
+                goalkeeper.goalkeeping
+                + goalkeeper.positioning * 0.30
+                + goalkeeper.composure * 0.20
+            )
+
+            save_chance = clamp(
+                0.42
+                + save_power / 220
+                - quality / 500,
+                0.30,
+                0.90,
+            )
+
+            if random.random() < save_chance:
+
+                goalkeeper.saves += 1
+
+                self._event(
+                    "save",
+                    team=goalkeeper.side,
+                    player=goalkeeper.id,
+                    shooter=player.id,
+                )
+
+                self._give_ball_to(
+                    goalkeeper
+                )
+
+                return
+
+            # Deflected / rebound.
+            self.ball.owner_id = None
+            self.ball.owner_side = None
+
+            self.ball.state = "loose"
+
+            self.ball.x = (
+                96
+                if player.side == "home"
+                else 4
+            )
+
+            self.ball.y = clamp(
+                player.y
+                + random.uniform(
+                    -8,
+                    8,
+                ),
+                2,
+                58,
+            )
+
+            self.ball.vx = (
+                -12
+                if player.side == "home"
+                else 12
+            )
+
+            self.ball.vy = random.uniform(
+                -6,
+                6,
+            )
+
+            self._event(
+                "rebound",
+                team=player.side,
+                player=player.id,
+            )
+
+            return
+
+        # Off target.
+        self.ball.owner_id = None
+        self.ball.owner_side = None
+
+        self.ball.state = "loose"
+
+        self.ball.x = (
+            98
+            if player.side == "home"
+            else 2
+        )
+
+        self.ball.y = clamp(
+            player.y
+            + random.uniform(
+                -12,
+                12,
+            ),
+            0,
+            60,
+        )
+
+        self.ball.vx = (
+            8
+            if player.side == "home"
+            else -8
+        )
+
+        self.ball.vy = random.uniform(
+            -4,
+            4,
+        )
+
+        self._event(
+            "shot_off_target",
+            team=player.side,
+            player=player.id,
+        )
+
+    # ========================================================
+    # GOALS
+    # ========================================================
+
+    def _goal(
+        self,
+        side: str,
+        scorer: Optional[Player] = None,
+    ):
+
+        self.score[side] += 1
+
+        if scorer:
+            scorer.goals += 1
+
+        self._event(
+            "goal",
+            team=side,
+            player=(
+                scorer.id
+                if scorer
+                else None
+            ),
+            score={
+                "home": self.score["home"],
+                "away": self.score["away"],
+            },
+        )
+
+        self.ball.owner_id = None
+        self.ball.owner_side = None
+
+        self.ball.state = "owned"
+
+        self.ball.x = 50
+        self.ball.y = 30
+
+        self.ball.vx = 0
+        self.ball.vy = 0
+
+        # Kickoff goes to the opposite team.
+        kickoff_side = self._other_side(
+            side
+        )
+
+        self.possession_side = (
+            kickoff_side
+        )
+
+        team = self._team(
+            kickoff_side
+        )
+
+        candidates = [
+            player
+            for player in team.on_pitch()
+            if player.position.upper()
+            not in {"GK", "G"}
+        ]
+
+        if not candidates:
+            candidates = team.on_pitch()
+
+        if candidates:
+            player = min(
+                candidates,
+                key=lambda p: abs(
+                    p.y - 30
+                ),
+            )
+
+            self._give_ball_to(
+                player
+            )
+
+        self._event(
+            "kickoff_after_goal",
+            team=kickoff_side,
+        )
+
+    # ========================================================
+    # DISTANCES / PRESSURE
+    # ========================================================
+
+    def _distance_to_opponent_goal(
+        self,
+        player: Player,
+    ):
+
+        goal_x = (
+            100
+            if player.side == "home"
+            else 0
+        )
+
+        dx = goal_x - player.x
+        dy = 30 - player.y
+
+        return math.sqrt(
+            dx * dx + dy * dy
+        )
+
+    def _pressure_on_player(
+        self,
+        player: Player,
+    ):
+
+        opponent = self._nearest_opponent(
+            player,
+            max_distance=12,
+        )
+
+        if not opponent:
+            return 0.0
+
+        d = distance(
+            {
+                "x": player.x,
+                "y": player.y,
+            },
+            {
+                "x": opponent.x,
+                "y": opponent.y,
+            },
+        )
+
+        return clamp(
+            1
+            - d / 12,
+            0,
+            1,
+        )
+
+    def _nearest_opponent(
+        self,
+        player: Player,
+        max_distance: float = 100,
+    ) -> Optional[Player]:
+
+        opponent_side = self._other_side(
+            player.side
+        )
+
+        opponents = self._team(
+            opponent_side
+        ).on_pitch()
+
+        nearest = None
+        nearest_distance = max_distance
+
+        for opponent in opponents:
+
+            d = distance(
+                {
+                    "x": player.x,
+                    "y": player.y,
+                },
+                {
+                    "x": opponent.x,
+                    "y": opponent.y,
+                },
+            )
+
+            if d < nearest_distance:
+
+                nearest = opponent
+                nearest_distance = d
+
+        return nearest
+
+    def _nearest_player(
+        self,
+        x: float,
+        y: float,
+        side: Optional[str] = None,
+        max_distance: float = 100,
+    ) -> Optional[Player]:
+
+        players = (
+            self._team(side).on_pitch()
+            if side
+            else self._all_players()
+        )
+
+        nearest = None
+        nearest_distance = max_distance
+
+        for player in players:
+
+            d = math.sqrt(
+                (player.x - x) ** 2
+                + (player.y - y) ** 2
+            )
+
+            if d < nearest_distance:
+
+                nearest = player
+                nearest_distance = d
+
+        return nearest
+
+    # ========================================================
+    # TACTICS
+    # ========================================================
+
+    def set_tactics(
+        self,
+        side: str,
+        tactics: dict[str, Any],
+    ):
+
+        with self.lock:
+
+            if side not in {
+                "home",
+                "away",
+            }:
+                raise ValueError(
+                    "side must be home or away"
+                )
+
+            team = self._team(side)
+
+            if not isinstance(
+                tactics,
+                dict,
+            ):
+                tactics = {}
+
+            team.tactics[
+                "mentality"
+            ] = str(
+                tactics.get(
+                    "mentality",
+                    team.tactics["mentality"],
+                )
+            )
+
+            team.tactics[
+                "tempo"
+            ] = clamp(
+                safe_float(
+                    tactics.get(
+                        "tempo",
+                        team.tactics["tempo"],
+                    ),
+                    team.tactics["tempo"],
+                ),
+                0,
+                100,
+            )
+
+            team.tactics[
+                "pressing"
+            ] = str(
+                tactics.get(
+                    "pressing",
+                    team.tactics["pressing"],
+                )
+            )
+
+            team.tactics[
+                "defensiveLine"
+            ] = str(
+                tactics.get(
+                    "defensiveLine",
+                    team.tactics["defensiveLine"],
+                )
+            )
+
+            team.tactics[
+                "width"
+            ] = clamp(
+                safe_float(
+                    tactics.get(
+                        "width",
+                        team.tactics["width"],
+                    ),
+                    team.tactics["width"],
+                ),
+                0,
+                100,
+            )
+
+            self._event(
+                "tactics_change",
+                team=side,
+                tactics=deepcopy(
+                    team.tactics
+                ),
+            )
+
+            return self.snapshot()
+
+    # ========================================================
+    # FORMATION
+    # ========================================================
+
+    def set_formation(
+        self,
+        side: str,
+        formation: str,
+    ):
+
+        with self.lock:
+
+            if side not in {
+                "home",
+                "away",
+            }:
+                raise ValueError(
+                    "side must be home or away"
+                )
+
+            formation = str(
+                formation
+            ).strip()
+
+            if formation not in FORMATION_POSITIONS:
+                raise ValueError(
+                    "Unsupported formation. "
+                    "Use 4-3-3, 4-4-2, 4-2-3-1, "
+                    "3-5-2 or 5-3-2."
+                )
+
+            team = self._team(side)
+
+            team.formation = formation
+
+            self._apply_positions(
+                team,
+                attacking_to_right=(
+                    side == "home"
+                ),
+            )
+
+            self._event(
+                "formation_change",
+                team=side,
+                formation=formation,
+            )
+
+            return self.snapshot()
+
+    # ========================================================
+    # SUBSTITUTIONS
+    # ========================================================
+
+    def substitute(
+        self,
+        side: str,
+        outgoing_id: Any,
+        incoming_id: Any,
+    ):
+
+        with self.lock:
+
+            if side not in {
+                "home",
+                "away",
+            }:
+                raise ValueError(
+                    "side must be home or away"
+                )
+
+            team = self._team(side)
+
+            if team.substitutions_used >= 5:
+                raise ValueError(
+                    "Maximum substitutions reached."
+                )
+
+            outgoing = self._find_player(
+                str(outgoing_id)
+                if outgoing_id is not None
+                else None
+            )
+
+            incoming = self._find_player(
+                str(incoming_id)
+                if incoming_id is not None
+                else None
+            )
+
+            if outgoing is None:
+                raise ValueError(
+                    "Outgoing player not found."
+                )
+
+            if incoming is None:
+                raise ValueError(
+                    "Incoming player not found."
+                )
+
+            if outgoing.side != side:
+                raise ValueError(
+                    "Outgoing player belongs to another team."
+                )
+
+            if incoming.side != side:
+                raise ValueError(
+                    "Incoming player belongs to another team."
+                )
+
+            if not outgoing.is_on_pitch:
+                raise ValueError(
+                    "Outgoing player is not on the pitch."
+                )
+
+            if incoming.is_on_pitch:
+                raise ValueError(
+                    "Incoming player is already on the pitch."
+                )
+
+            outgoing.is_on_pitch = False
+
+            incoming.is_on_pitch = True
+
+            incoming.x = outgoing.x
+            incoming.y = outgoing.y
+
+            incoming.target_x = outgoing.x
+            incoming.target_y = outgoing.y
+
+            team.substitutions_used += 1
+
+            self._apply_positions(
+                team,
+                attacking_to_right=(
+                    side == "home"
+                ),
+            )
+
+            self._event(
+                "substitution",
+                team=side,
+                player=incoming.id,
+                outgoing=outgoing.id,
+                incoming=incoming.id,
+            )
+
+            # If substituted player had the ball,
+            # give it to nearest teammate.
+            if (
+                self.ball.owner_id
+                == outgoing.id
+            ):
+
+                self.ball.owner_id = None
+                self.ball.owner_side = None
+
+                teammate = self._nearest_player(
+                    outgoing.x,
+                    outgoing.y,
+                    side=side,
+                    max_distance=20,
+                )
+
+                if teammate:
+                    self._give_ball_to(
+                        teammate
+                    )
+                else:
+                    self._reset_ball()
+
+            return self.snapshot()
+
+    # ========================================================
+    # SERIALIZATION
+    # ========================================================
+
+    def _player_stamina(self):
+        result = {}
+
+        for player in (
+            self.home.players
+            + self.away.players
+        ):
+            result[player.id] = round(
+                player.stamina_current,
+                1,
+            )
+
+        return result
+
+    def _snapshot_stats(self):
+
+        return {
+            "possession": deepcopy(
+                self.stats["possession"]
+            ),
+            "shots": deepcopy(
+                self.stats["shots"]
+            ),
+            "shotsOnTarget": deepcopy(
+                self.stats["shotsOnTarget"]
+            ),
+            "passes": deepcopy(
+                self.stats["passes"]
+            ),
+            "passesCompleted": deepcopy(
+                self.stats["passesCompleted"]
+            ),
+            "tackles": deepcopy(
+                self.stats["tackles"]
+            ),
+            "corners": deepcopy(
+                self.stats["corners"]
+            ),
+            "fouls": deepcopy(
+                self.stats["fouls"]
+            ),
+            "yellowCards": deepcopy(
+                self.stats["yellowCards"]
+            ),
+            "redCards": deepcopy(
+                self.stats["redCards"]
+            ),
+            "offsides": deepcopy(
+                self.stats["offsides"]
+            ),
+        }
+
+    def snapshot(self):
+
+        with self.lock:
+
+            return {
+                "ok": True,
+
+                "matchId": self.match_id,
+
+                "status": self.status,
+
+                "running": self.running,
+
+                "finished": self.finished,
+
+                "half": self.half,
+
+                "minute": self.minute(),
+
+                "second": self.second(),
+
+                "clock": self.clock_string(),
+
+                "footballSeconds": round(
+                    self.football_seconds,
+                    2,
+                ),
+
+                "injuryTime": (
+                    self.first_half_injury
+                    if self.half == 1
+                    else self.second_half_injury
+                ),
+
+                "score": {
+                    "home": self.score["home"],
+                    "away": self.score["away"],
+                },
+
+                "homeScore": self.score["home"],
+
+                "awayScore": self.score["away"],
+
+                "home": self.home.to_dict(),
+
+                "away": self.away.to_dict(),
+
+                "ball": self.ball.to_dict(),
+
+                "possession": self.possession_side,
+
+                "possessionSide": self.possession_side,
+
+                "stats": self._snapshot_stats(),
+
+                "events": deepcopy(
+                    self.events
+                ),
+
+                "lastEvent": deepcopy(
+                    self.last_event
+                ),
+
+                "playerStamina": self._player_stamina(),
+
+                "result": deepcopy(
+                    self.result
+                ),
+            }
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    def destroy(self):
+
+        with self.lock:
+
+            self.destroyed = True
+
+            self.running = False
+
+            self.finished = True
+
+            self.status = "finished"
+
+            self.stop_event.set()
+
+
+# ============================================================
+# COMPATIBILITY ALIAS
+# ============================================================
+
+FootballEngine = FootballMatch
