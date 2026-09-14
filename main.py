@@ -7,9 +7,10 @@ from football_engine import FootballMatch
 
 
 app = FastAPI(
-    title="Virtual Football Manager Python Engine",
-    version="2.0.0",
+    title="Virtual Football Manager Engine",
+    version="1.2.0",
 )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,7 +33,7 @@ def root():
     return {
         "ok": True,
         "service": "Virtual Football Manager Python Engine",
-        "version": "2.0.0",
+        "version": "1.0.0",
     }
 
 
@@ -41,14 +42,15 @@ def health():
     return {
         "ok": True,
         "service": "football-engine",
-        "version": "2.0.0",
         "matches": len(matches),
     }
 
 
 @app.post("/match/create")
 def create_match(config: dict[str, Any]):
-    match_id = str(config.get("matchId", "")).strip()
+    match_id = str(
+        config.get("matchId", "")
+    ).strip()
 
     if not match_id:
         raise HTTPException(
@@ -62,6 +64,7 @@ def create_match(config: dict[str, Any]):
     try:
         match = FootballMatch(config)
         matches[match_id] = match
+
         return match.snapshot()
 
     except Exception as exc:
@@ -126,7 +129,10 @@ def update_tactics(
     side = body.get("side", "home")
     tactics = body.get("tactics", {})
 
-    return match.set_tactics(side, tactics)
+    return match.set_tactics(
+        side,
+        tactics,
+    )
 
 
 @app.post("/match/{match_id}/formation")
