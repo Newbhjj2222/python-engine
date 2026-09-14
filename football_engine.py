@@ -1,108 +1,120 @@
+from __future__ import annotations
+
+import math
 import random
 import threading
 import time
-from typing import Any
+import uuid
+from typing import Any, Dict, List, Optional
 
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 PITCH_WIDTH = 100.0
 PITCH_HEIGHT = 60.0
 
 MATCH_MINUTES = 90
+REAL_MATCH_SECONDS = 480.0   # 8 minutes = 90 football minutes
+TICK_SECONDS = 0.25
 
-REAL_MATCH_SECONDS = 480.0
+MAX_EVENTS = 300
+MAX_PLAYERS = 30
 
-TICK_SECONDS = 0.20
-
-FORMATION_POSITIONS = {
-    "4-3-3": [
-        ("GK", 5, 30),
-        ("LB", 18, 10),
-        ("CB", 17, 24),
-        ("CB", 17, 36),
-        ("RB", 18, 50),
-        ("CM", 35, 20),
-        ("CM", 36, 30),
-        ("CM", 35, 42),
-        ("LW", 50, 10),
-        ("ST", 55, 30),
-        ("RW", 50, 50),
-    ],
+FORMATIONS = {
     "4-4-2": [
-        ("GK", 5, 30),
-        ("LB", 18, 10),
-        ("CB", 17, 24),
-        ("CB", 17, 36),
-        ("RB", 18, 50),
-        ("LM", 35, 10),
-        ("CM", 36, 25),
-        ("CM", 36, 35),
-        ("RM", 35, 50),
-        ("ST", 54, 25),
-        ("ST", 54, 38),
+        "GK",
+        "RB", "CB", "CB", "LB",
+        "RM", "CM", "CM", "LM",
+        "ST", "ST",
+    ],
+    "4-3-3": [
+        "GK",
+        "RB", "CB", "CB", "LB",
+        "CM", "CM", "CM",
+        "RW", "ST", "LW",
     ],
     "3-5-2": [
-        ("GK", 5, 30),
-        ("CB", 17, 20),
-        ("CB", 16, 30),
-        ("CB", 17, 40),
-        ("LWB", 32, 8),
-        ("CM", 35, 22),
-        ("CM", 37, 30),
-        ("CM", 35, 38),
-        ("RWB", 32, 52),
-        ("ST", 54, 25),
-        ("ST", 54, 38),
+        "GK",
+        "CB", "CB", "CB",
+        "RWB", "CM", "CM", "CM", "LWB",
+        "ST", "ST",
     ],
     "5-3-2": [
-        ("GK", 5, 30),
-        ("LB", 17, 8),
-        ("CB", 16, 21),
-        ("CB", 15, 30),
-        ("CB", 16, 39),
-        ("RB", 17, 52),
-        ("CM", 35, 22),
-        ("CM", 36, 30),
-        ("CM", 35, 40),
-        ("ST", 54, 25),
-        ("ST", 54, 38),
+        "GK",
+        "RWB", "CB", "CB", "CB", "LWB",
+        "CM", "CM", "CM",
+        "ST", "ST",
     ],
     "4-2-3-1": [
-        ("GK", 5, 30),
-        ("LB", 18, 10),
-        ("CB", 17, 24),
-        ("CB", 17, 36),
-        ("RB", 18, 50),
-        ("DM", 32, 24),
-        ("DM", 32, 36),
-        ("LW", 46, 10),
-        ("AM", 47, 30),
-        ("RW", 46, 50),
-        ("ST", 55, 30),
+        "GK",
+        "RB", "CB", "CB", "LB",
+        "CDM", "CDM",
+        "RW", "CAM", "LW",
+        "ST",
     ],
 }
 
 
-def number(value, default=0.0):
+# ============================================================
+# HELPERS
+# ============================================================
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
     except Exception:
-        return float(default)
+        return default
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
 
+
+def distance(a: Dict[str, float], b: Dict[str, float]) -> float:
+    return math.sqrt(
+        (a["x"] - b["x"]) ** 2 +
+        (a["y"] - b["y"]) ** 2
+    )
+
+
+def normalize_text(value: Any, fallback: str = "") -> str:
+    if value is None:
+        return fallback
+
+    text = str(value).strip()
+
+    return text if text else fallback
+
+
+# ============================================================
+# ENGINE
+# ============================================================
 
 class FootballMatch:
-    def __init__(self, config: dict[str, Any]):
-        self.match_id = str(
-            config.get("matchId")
-            or config.get("id")
-        )
 
+    def __init__(self, config: Dict[str, Any]):
         self.lock = threading.RLock()
 
+        self.match_id = normalize_text(
+            config.get("matchId") or config.get("id"),
+            str(uuid.uuid4()),
+        )
+
+        self.created_at = time.time()
+
         self.status = "created"
+
+        self.running = False
+        self.finished = False
 
         self.minute = 0
         self.second = 0
@@ -114,331 +126,671 @@ class FootballMatch:
             "away": 0,
         }
 
-        self.home = self._create_team(
-            config.get("home", {}),
-            "home",
-            True,
-        )
-
-        self.away = self._create_team(
-            config.get("away", {}),
-            "away",
-            False,
-        )
-
         self.ball = {
             "x": 50.0,
             "y": 30.0,
-            "ownerId": None,
-            "ownerSide": None,
-            "state": "free",
-            "targetId": None,
+            "owner": None,
+            "team": None,
+            "state": "dead",
         }
 
-        self.events: list[dict[str, Any]] = []
+        self.events: List[Dict[str, Any]] = []
 
-        self.stats = {
-            "home": self._empty_stats(),
-            "away": self._empty_stats(),
-        }
+        self.thread: Optional[threading.Thread] = None
 
-        self.running = False
-        self.thread = None
-        self.finished = False
-
-        self.last_action_time = 0.0
-        self.last_event_time = 0.0
+        self.last_tick = time.time()
 
         self.halftime_done = False
 
-        self._assign_initial_ball()
+        self.possession_team = "home"
+
+        self.attack_team = "home"
+
+        self.last_event_time = 0.0
+
+        self.cooldowns = {
+            "shot": {
+                "home": 0.0,
+                "away": 0.0,
+            },
+            "corner": {
+                "home": 0.0,
+                "away": 0.0,
+            },
+            "foul": {
+                "home": 0.0,
+                "away": 0.0,
+            },
+        }
+
+        self.home = self._create_team(
+            config.get("home") or {},
+            "home",
+            "Home",
+        )
+
+        self.away = self._create_team(
+            config.get("away") or {},
+            "away",
+            "Away",
+        )
+
+        self.stats = self._create_match_stats()
+
+        self._place_players()
 
         self._event(
-            0,
-            "kickoff",
-            "Kick-off",
+            "match_created",
+            "Match created",
+            None,
             None,
         )
 
-    # ---------------------------------------------------------
-    # TEAM / PLAYER
-    # ---------------------------------------------------------
+    # ========================================================
+    # TEAM CREATION
+    # ========================================================
 
     def _create_team(
         self,
-        source: dict[str, Any],
+        source: Dict[str, Any],
         side: str,
-        is_home: bool,
-    ):
-        source = source or {}
+        fallback_name: str,
+    ) -> Dict[str, Any]:
 
-        raw_players = (
+        formation = normalize_text(
+            source.get("formation"),
+            "4-3-3",
+        )
+
+        if formation not in FORMATIONS:
+            formation = "4-3-3"
+
+        players_source = (
             source.get("players")
             or source.get("lineup")
             or source.get("squad")
             or []
         )
 
-        raw_bench = (
+        bench_source = (
             source.get("bench")
             or source.get("substitutes")
             or []
         )
 
-        if not isinstance(raw_players, list):
-            raw_players = []
+        players = []
 
-        if not isinstance(raw_bench, list):
-            raw_bench = []
-
-        players = [
-            self._create_player(
-                player,
-                i,
-                side,
-            )
-            for i, player in enumerate(raw_players[:11])
-        ]
-
-        bench = [
-            self._create_player(
-                player,
-                i + 11,
-                side,
-            )
-            for i, player in enumerate(raw_bench[:9])
-        ]
-
-        if len(players) < 11:
-            for i in range(len(players), 11):
-                players.append(
-                    self._create_player(
-                        {},
-                        i,
-                        side,
+        if isinstance(players_source, list):
+            for index, player in enumerate(players_source[:11]):
+                if isinstance(player, dict):
+                    players.append(
+                        self._create_player(
+                            player,
+                            index,
+                            side,
+                        )
                     )
+
+        bench = []
+
+        if isinstance(bench_source, list):
+            for index, player in enumerate(bench_source[:12]):
+                if isinstance(player, dict):
+                    bench.append(
+                        self._create_player(
+                            player,
+                            index + 11,
+                            side,
+                            is_bench=True,
+                        )
+                    )
+
+        # IMPORTANT:
+        # We do not want generic players if Firebase actually
+        # supplied players. But if fewer than 11 were supplied,
+        # the match still needs a complete XI.
+        while len(players) < 11:
+            index = len(players)
+
+            players.append(
+                self._create_player(
+                    {
+                        "id": f"{side}-fallback-{index + 1}",
+                        "name": f"{fallback_name} Player {index + 1}",
+                        "number": index + 1,
+                    },
+                    index,
+                    side,
                 )
-
-        formation = (
-            source.get("formation")
-            or "4-3-3"
-        )
-
-        if formation not in FORMATION_POSITIONS:
-            formation = "4-3-3"
-
-        self._apply_formation(
-            players,
-            formation,
-            is_home,
-        )
+            )
 
         return {
-            "id": str(
-                source.get("id")
-                or source.get("clubId")
-                or side
+            "id": normalize_text(
+                source.get("id") or source.get("clubId"),
+                side,
             ),
-            "name": (
+            "name": normalize_text(
                 source.get("name")
                 or source.get("clubName")
-                or (
-                    "Home Team"
-                    if is_home
-                    else "Away Team"
-                )
+                or source.get("teamName"),
+                fallback_name,
             ),
-            "logo": (
+            "logo": normalize_text(
                 source.get("logo")
                 or source.get("logoUrl")
-                or source.get("image")
-                or ""
+                or source.get("imageUrl"),
+                "",
             ),
+            "side": side,
             "formation": formation,
+            "tactics": self._create_tactics(
+                source.get("tactics") or {}
+            ),
             "players": players,
             "bench": bench,
-            "tactics": {
-                "mentality": "balanced",
-                "tempo": 65,
-                "pressing": "medium",
-                "defensiveLine": "medium",
-                "width": 55,
-            },
-            "stats": self._empty_stats(),
             "substitutionsUsed": 0,
+            "stats": self._empty_team_stats(),
         }
+
+    # ========================================================
+    # PLAYER CREATION
+    # ========================================================
 
     def _create_player(
         self,
-        source: dict[str, Any],
+        source: Dict[str, Any],
         index: int,
         side: str,
-    ):
-        source = source or {}
+        is_bench: bool = False,
+    ) -> Dict[str, Any]:
 
-        ratings = source.get("ratings") or {}
+        ratings = source.get("ratings")
 
-        pid = str(
+        if not isinstance(ratings, dict):
+            ratings = {}
+
+        player_id = normalize_text(
             source.get("id")
             or source.get("playerId")
-            or f"{side}-player-{index + 1}"
+            or source.get("uid"),
+            f"{side}-player-{index + 1}",
         )
 
-        name = (
+        name = normalize_text(
             source.get("name")
             or source.get("displayName")
-            or source.get("fullName")
-            or f"Player {index + 1}"
+            or source.get("fullName"),
+            f"Player {index + 1}",
         )
 
-        return {
-            "id": pid,
+        position = normalize_text(
+            source.get("position")
+            or source.get("role")
+            or source.get("preferredPosition"),
+            "CM",
+        ).upper()
+
+        player = {
+            "id": player_id,
             "name": name,
-            "number": int(
-                number(
-                    source.get("number")
-                    or source.get("shirtNumber")
-                    or source.get("jerseyNumber")
-                    or index + 1,
-                    index + 1,
-                )
+            "number": safe_int(
+                source.get("number")
+                or source.get("shirtNumber"),
+                index + 1,
             ),
-            "position": (
-                source.get("position")
-                or source.get("role")
-                or "CM"
-            ),
-            "role": (
-                source.get("role")
-                or source.get("position")
-                or "CM"
-            ),
-            "pace": number(
-                source.get("pace", ratings.get("pace", 70)),
-                70,
-            ),
-            "passing": number(
-                source.get(
-                    "passing",
-                    ratings.get("passing", 70),
-                ),
-                70,
-            ),
-            "shooting": number(
-                source.get(
-                    "shooting",
-                    ratings.get("shooting", 65),
-                ),
-                65,
-            ),
-            "dribbling": number(
-                source.get(
-                    "dribbling",
-                    ratings.get("dribbling", 68),
-                ),
+            "position": position,
+            "role": position,
+            "side": side,
+            "isBench": is_bench,
+            "active": not is_bench,
+
+            "pace": self._rating(
+                source,
+                ratings,
+                "pace",
                 68,
             ),
-            "defending": number(
-                source.get(
-                    "defending",
-                    ratings.get("defending", 65),
-                ),
+
+            "passing": self._rating(
+                source,
+                ratings,
+                "passing",
+                68,
+            ),
+
+            "shooting": self._rating(
+                source,
+                ratings,
+                "shooting",
                 65,
             ),
-            "stamina": number(
-                source.get(
-                    "stamina",
-                    ratings.get("stamina", 80),
-                ),
-                80,
+
+            "dribbling": self._rating(
+                source,
+                ratings,
+                "dribbling",
+                67,
             ),
-            "strength": number(
-                source.get(
-                    "strength",
-                    ratings.get("strength", 70),
-                ),
+
+            "defending": self._rating(
+                source,
+                ratings,
+                "defending",
+                65,
+            ),
+
+            "stamina": self._rating(
+                source,
+                ratings,
+                "stamina",
+                75,
+            ),
+
+            "strength": self._rating(
+                source,
+                ratings,
+                "strength",
                 70,
             ),
-            "vision": number(
-                source.get(
-                    "vision",
-                    ratings.get("vision", 70),
-                ),
-                70,
+
+            "vision": self._rating(
+                source,
+                ratings,
+                "vision",
+                68,
             ),
-            "goalkeeping": number(
-                source.get(
-                    "goalkeeping",
-                    ratings.get("goalkeeping", 60),
-                ),
-                60,
+
+            "goalkeeping": self._rating(
+                source,
+                ratings,
+                "goalkeeping",
+                65,
             ),
+
+            "morale": 70.0,
+
+            "energy": 100.0,
+
             "x": 50.0,
             "y": 30.0,
+
             "targetX": 50.0,
             "targetY": 30.0,
-            "staminaNow": 100.0,
+
             "hasBall": False,
-            "lastAction": "positioning",
+
+            "action": "idle",
+
             "lastActionAt": 0.0,
-            "goals": 0,
-            "assists": 0,
-            "shots": 0,
-            "passes": 0,
-            "completedPasses": 0,
-            "tackles": 0,
-            "interceptions": 0,
-            "saves": 0,
-            "yellow": False,
-            "red": False,
+
+            "cooldown": 0.0,
+
+            "stats": self._empty_player_stats(),
         }
 
-    def _apply_formation(
+        return player
+
+    def _rating(
         self,
-        players,
-        formation,
-        is_home,
-    ):
-        positions = FORMATION_POSITIONS[formation]
+        source: Dict[str, Any],
+        ratings: Dict[str, Any],
+        key: str,
+        default: float,
+    ) -> float:
 
-        for i, player in enumerate(players[:11]):
-            role, x, y = positions[i]
+        value = source.get(key)
 
-            if not is_home:
-                x = 100 - x
+        if value is None:
+            value = ratings.get(key)
 
-            player["position"] = role
-            player["role"] = role
-            player["x"] = float(x)
-            player["y"] = float(y)
-            player["targetX"] = float(x)
-            player["targetY"] = float(y)
+        return clamp(
+            safe_float(value, default),
+            1,
+            100,
+        )
 
-    # ---------------------------------------------------------
-    # STATS
-    # ---------------------------------------------------------
+    # ========================================================
+    # TACTICS
+    # ========================================================
 
-    def _empty_stats(self):
+    def _create_tactics(
+        self,
+        source: Dict[str, Any],
+    ) -> Dict[str, Any]:
+
         return {
-            "possession": 50,
+            "mentality": normalize_text(
+                source.get("mentality"),
+                "balanced",
+            ),
+
+            "tempo": clamp(
+                safe_float(
+                    source.get("tempo"),
+                    60,
+                ),
+                1,
+                100,
+            ),
+
+            "pressing": normalize_text(
+                source.get("pressing"),
+                "medium",
+            ),
+
+            "defensiveLine": normalize_text(
+                source.get("defensiveLine"),
+                "medium",
+            ),
+
+            "width": clamp(
+                safe_float(
+                    source.get("width"),
+                    55,
+                ),
+                1,
+                100,
+            ),
+        }
+
+    # ========================================================
+    # STATS
+    # ========================================================
+
+    def _empty_player_stats(self):
+        return {
+            "passes": 0,
+            "passesCompleted": 0,
             "shots": 0,
             "shotsOnTarget": 0,
-            "passes": 0,
-            "completedPasses": 0,
+            "goals": 0,
+            "assists": 0,
+            "dribbles": 0,
             "tackles": 0,
             "interceptions": 0,
+            "fouls": 0,
+            "fouled": 0,
+            "saves": 0,
+            "corners": 0,
+            "offsides": 0,
+        }
+
+    def _empty_team_stats(self):
+        return {
+            "possession": 50,
+            "passes": 0,
+            "passesCompleted": 0,
+            "shots": 0,
+            "shotsOnTarget": 0,
+            "goals": 0,
             "corners": 0,
             "fouls": 0,
             "offsides": 0,
+            "tackles": 0,
+            "interceptions": 0,
             "saves": 0,
         }
 
-    # ---------------------------------------------------------
-    # START / STOP
-    # ---------------------------------------------------------
+    def _create_match_stats(self):
+        return {
+            "home": self._empty_team_stats(),
+            "away": self._empty_team_stats(),
+        }
+
+    # ========================================================
+    # PLAYER POSITIONS
+    # ========================================================
+
+    def _formation_positions(
+        self,
+        formation: str,
+        side: str,
+    ) -> List[Dict[str, float]]:
+
+        attacking = side == "home"
+
+        if formation == "4-4-2":
+            positions = [
+                (8, 30),
+                (22, 8),
+                (18, 22),
+                (18, 38),
+                (22, 52),
+                (42, 8),
+                (38, 23),
+                (38, 37),
+                (42, 52),
+                (70, 22),
+                (70, 38),
+            ]
+
+        elif formation == "4-3-3":
+            positions = [
+                (8, 30),
+                (22, 8),
+                (18, 22),
+                (18, 38),
+                (22, 52),
+                (40, 18),
+                (38, 30),
+                (40, 42),
+                (68, 10),
+                (74, 30),
+                (68, 50),
+            ]
+
+        elif formation == "3-5-2":
+            positions = [
+                (8, 30),
+                (20, 16),
+                (18, 30),
+                (20, 44),
+                (38, 7),
+                (36, 20),
+                (38, 30),
+                (36, 40),
+                (38, 53),
+                (70, 22),
+                (70, 38),
+            ]
+
+        elif formation == "5-3-2":
+            positions = [
+                (8, 30),
+                (18, 7),
+                (15, 19),
+                (16, 30),
+                (15, 41),
+                (18, 53),
+                (38, 18),
+                (38, 30),
+                (38, 42),
+                (70, 22),
+                (70, 38),
+            ]
+
+        else:
+            positions = [
+                (8, 30),
+                (22, 8),
+                (18, 22),
+                (18, 38),
+                (22, 52),
+                (35, 22),
+                (35, 38),
+                (52, 10),
+                (52, 30),
+                (52, 50),
+                (72, 30),
+            ]
+
+        result = []
+
+        for x, y in positions:
+            if not attacking:
+                x = PITCH_WIDTH - x
+
+            result.append({
+                "x": float(x),
+                "y": float(y),
+            })
+
+        return result
+
+    def _place_players(self):
+
+        for team in [
+            self.home,
+            self.away,
+        ]:
+
+            positions = self._formation_positions(
+                team["formation"],
+                team["side"],
+            )
+
+            roles = FORMATIONS.get(
+                team["formation"],
+                FORMATIONS["4-3-3"],
+            )
+
+            for index, player in enumerate(
+                team["players"]
+            ):
+
+                position = positions[
+                    min(index, len(positions) - 1)
+                ]
+
+                role = roles[
+                    min(index, len(roles) - 1)
+                ]
+
+                player["role"] = role
+
+                player["position"] = role
+
+                player["x"] = position["x"]
+                player["y"] = position["y"]
+
+                player["targetX"] = position["x"]
+                player["targetY"] = position["y"]
+
+        # Ball starts with central midfielder
+        home_mid = self._find_best_player(
+            self.home,
+            ["CM", "CAM", "CDM"],
+        )
+
+        if home_mid:
+            self._give_ball(
+                home_mid,
+                "home",
+            )
+
+    # ========================================================
+    # PLAYER SEARCH
+    # ========================================================
+
+    def _all_players(self, side: str):
+        team = self.home if side == "home" else self.away
+
+        return [
+            p
+            for p in team["players"]
+            if p.get("active")
+        ]
+
+    def _find_player(
+        self,
+        side: str,
+        player_id: str,
+    ):
+
+        for player in self._all_players(side):
+
+            if str(player["id"]) == str(player_id):
+                return player
+
+        return None
+
+    def _find_best_player(
+        self,
+        team: Dict[str, Any],
+        positions: List[str],
+    ):
+
+        candidates = [
+            p
+            for p in team["players"]
+            if p.get("active")
+            and (
+                p.get("position") in positions
+                or p.get("role") in positions
+            )
+        ]
+
+        if not candidates:
+            candidates = [
+                p
+                for p in team["players"]
+                if p.get("active")
+            ]
+
+        if not candidates:
+            return None
+
+        return max(
+            candidates,
+            key=lambda p: (
+                p["passing"]
+                + p["vision"]
+                + p["stamina"]
+            ),
+        )
+
+    # ========================================================
+    # BALL
+    # ========================================================
+
+    def _give_ball(
+        self,
+        player: Dict[str, Any],
+        side: str,
+    ):
+
+        for team_side in ["home", "away"]:
+
+            for p in self._all_players(team_side):
+                p["hasBall"] = False
+
+        player["hasBall"] = True
+
+        self.ball["owner"] = player["id"]
+        self.ball["team"] = side
+        self.ball["x"] = player["x"]
+        self.ball["y"] = player["y"]
+        self.ball["state"] = "controlled"
+
+        self.possession_team = side
+
+    def _clear_ball(self):
+
+        for side in ["home", "away"]:
+            for player in self._all_players(side):
+                player["hasBall"] = False
+
+        self.ball["owner"] = None
+        self.ball["state"] = "free"
+
+    # ========================================================
+    # MATCH START
+    # ========================================================
 
     def start(self):
+
         with self.lock:
+
             if self.finished:
                 return self.snapshot()
 
@@ -448,391 +800,353 @@ class FootballMatch:
             self.status = "playing"
             self.running = True
 
-            if self.thread is None or not self.thread.is_alive():
+            self.last_tick = time.time()
+
+            if (
+                self.thread is None
+                or not self.thread.is_alive()
+            ):
+
                 self.thread = threading.Thread(
-                    target=self._run,
+                    target=self._run_loop,
                     daemon=True,
                 )
+
                 self.thread.start()
 
             self._event(
-                self.minute,
-                "match",
-                "Match is live",
+                "match_started",
+                "Match started",
+                None,
                 None,
             )
 
             return self.snapshot()
 
-    def pause(self):
-        with self.lock:
-            self.running = False
+    # ========================================================
+    # LOOP
+    # ========================================================
 
-            if not self.finished:
-                self.status = "paused"
-
-            return self.snapshot()
-
-    def finish(self):
-        with self.lock:
-            self.running = False
-            self.finished = True
-            self.status = "finished"
-            self.minute = 90
-            self.second = 0
-
-            self._event(
-                90,
-                "full_time",
-                "Full time",
-                None,
-            )
-
-            return self.snapshot()
-
-    # ---------------------------------------------------------
-    # ENGINE LOOP
-    # ---------------------------------------------------------
-
-    def _run(self):
-        last = time.monotonic()
+    def _run_loop(self):
 
         while True:
-            time.sleep(TICK_SECONDS)
-
-            now = time.monotonic()
-            dt = now - last
-            last = now
 
             with self.lock:
-                if not self.running:
-                    continue
 
                 if self.finished:
                     break
 
-                self._advance(dt)
+                if not self.running:
+                    pass
+                else:
+                    now = time.time()
 
-    def _advance(self, dt):
-        self.elapsed_real += dt
+                    elapsed = now - self.last_tick
 
-        football_seconds = (
-            self.elapsed_real
-            * MATCH_MINUTES
-            * 60
-            / REAL_MATCH_SECONDS
-        )
+                    self.last_tick = now
 
-        total_seconds = int(
-            football_seconds
-        )
+                    elapsed = clamp(
+                        elapsed,
+                        0.01,
+                        1.0,
+                    )
 
-        if total_seconds >= 90 * 60:
-            self.minute = 90
-            self.second = 0
-            self._finish_internal()
+                    self._advance(
+                        elapsed
+                    )
+
+            time.sleep(TICK_SECONDS)
+
+    # ========================================================
+    # ADVANCE
+    # ========================================================
+
+    def _advance(
+        self,
+        real_seconds: float,
+    ):
+
+        if self.status != "playing":
             return
 
-        self.minute = total_seconds // 60
-        self.second = total_seconds % 60
+        self.elapsed_real += real_seconds
+
+        football_minutes = (
+            self.elapsed_real
+            / REAL_MATCH_SECONDS
+        ) * MATCH_MINUTES
+
+        football_minutes = clamp(
+            football_minutes,
+            0,
+            90,
+        )
+
+        self.minute = int(
+            football_minutes
+        )
+
+        self.second = int(
+            (football_minutes - self.minute)
+            * 60
+        )
 
         if (
             self.minute >= 45
             and not self.halftime_done
         ):
             self._halftime()
-
-        self._move_players(dt)
-
-        self._run_ai()
-
-        self._update_possession_stats()
-
-    # ---------------------------------------------------------
-    # HALFTIME
-    # ---------------------------------------------------------
-
-    def _halftime(self):
-        self.halftime_done = True
-        self.status = "halftime"
-        self.running = False
-
-        self._event(
-            45,
-            "halftime",
-            "Half time",
-            None,
-        )
-
-        self._swap_sides()
-
-    def _swap_sides(self):
-        for team in [
-            self.home,
-            self.away,
-        ]:
-            for p in team["players"]:
-                p["x"] = 100 - p["x"]
-                p["targetX"] = 100 - p["targetX"]
-
-        self.ball["x"] = 100 - self.ball["x"]
-
-    def _finish_internal(self):
-        self.running = False
-        self.finished = True
-        self.status = "finished"
-
-        self._event(
-            90,
-            "full_time",
-            "Full time",
-            None,
-        )
-
-    # ---------------------------------------------------------
-    # AI
-    # ---------------------------------------------------------
-
-    def _run_ai(self):
-        self._recover_ball_if_needed()
-
-        owner = self._get_ball_owner()
-
-        if owner is None:
-            self._move_ball()
             return
 
-        side = (
-            self.ball["ownerSide"]
-            or "home"
-        )
+        if self.minute >= 90:
 
-        team = self.home if side == "home" else self.away
-        opponent = self.away if side == "home" else self.home
+            self.minute = 90
+            self.second = 0
 
-        player = self._find_player(
-            team,
-            owner,
-        )
+            self._finish_match()
 
-        if not player:
             return
 
-        player["hasBall"] = True
-
-        now = time.monotonic()
-
-        if (
-            now - player["lastActionAt"]
-            < random.uniform(0.7, 1.5)
-        ):
-            return
-
-        player["lastActionAt"] = now
-
-        distance_to_goal = self._goal_distance(
-            player,
-            side,
+        self._update_stamina(
+            real_seconds
         )
 
-        pressure = self._pressure(
-            player,
-            opponent,
+        self._update_players(
+            real_seconds
         )
 
-        # Shoot close to goal.
-        if distance_to_goal < 24:
-            if self._should_shoot(
-                player,
-                pressure,
-            ):
-                self._attempt_shot(
-                    player,
-                    team,
-                    side,
-                )
-                return
-
-        # Cross from wings.
-        if (
-            distance_to_goal < 35
-            and player["y"] < 14
-            or distance_to_goal < 35
-            and player["y"] > 46
-        ):
-            if random.random() < 0.45:
-                self._cross(
-                    player,
-                    team,
-                    opponent,
-                    side,
-                )
-                return
-
-        # Dribble when space exists.
-        if (
-            pressure < 0.35
-            and random.random() < 0.34
-        ):
-            self._dribble(
-                player,
-                side,
-            )
-            return
-
-        # Attackers should progress.
-        if (
-            player["position"]
-            in {
-                "ST",
-                "LW",
-                "RW",
-                "AM",
-                "LM",
-                "RM",
-            }
-        ):
-            if random.random() < 0.62:
-                self._advance_player(
-                    player,
-                    side,
-                )
-                return
-
-        # Through ball.
-        if random.random() < 0.20:
-            if self._through_ball(
-                player,
-                team,
-                opponent,
-                side,
-            ):
-                return
-
-        self._pass(
-            player,
-            team,
-            opponent,
-            side,
+        self._update_ball(
+            real_seconds
         )
 
-    # ---------------------------------------------------------
-    # MOVEMENT
-    # ---------------------------------------------------------
+        self._maybe_random_event()
 
-    def _move_players(self, dt):
-        owner_side = self.ball.get("ownerSide")
+    # ========================================================
+    # STAMINA
+    # ========================================================
 
-        for side, team in [
-            ("home", self.home),
-            ("away", self.away),
-        ]:
-            attacking = (
-                owner_side == side
+    def _update_stamina(
+        self,
+        real_seconds: float,
+    ):
+
+        drain = (
+            real_seconds
+            * 0.012
+        )
+
+        for side in ["home", "away"]:
+
+            team = (
+                self.home
+                if side == "home"
+                else self.away
             )
 
-            for player in team["players"]:
-                if player["red"]:
-                    continue
+            pressing = team["tactics"].get(
+                "pressing",
+                "medium",
+            )
 
-                speed = (
-                    0.025
-                    * (
-                        0.65
-                        + player["pace"] / 100
-                    )
-                )
+            multiplier = {
+                "low": 0.7,
+                "medium": 1.0,
+                "high": 1.35,
+            }.get(
+                pressing,
+                1.0,
+            )
 
-                if attacking:
-                    if player["position"] in {
-                        "ST",
-                        "LW",
-                        "RW",
-                        "AM",
-                        "LM",
-                        "RM",
-                    }:
-                        direction = (
-                            1
-                            if side == "home"
-                            else -1
-                        )
+            for player in self._all_players(side):
 
-                        player["targetX"] += (
-                            direction
-                            * speed
-                            * 2.0
-                        )
-
-                    self._make_attacking_run(
-                        player,
-                        side,
-                    )
-                else:
-                    self._defensive_position(
-                        player,
-                        side,
-                    )
-
-                player["targetX"] = clamp(
-                    player["targetX"],
-                    2,
-                    98,
-                )
-
-                player["targetY"] = clamp(
-                    player["targetY"],
-                    3,
-                    57,
-                )
-
-                dx = (
-                    player["targetX"]
-                    - player["x"]
-                )
-
-                dy = (
-                    player["targetY"]
-                    - player["y"]
-                )
-
-                distance = (
-                    dx * dx
-                    + dy * dy
-                ) ** 0.5
-
-                if distance > 0.2:
-                    step = min(
-                        distance,
-                        speed * dt * 8,
-                    )
-
-                    player["x"] += (
-                        dx / distance
-                    ) * step
-
-                    player["y"] += (
-                        dy / distance
-                    ) * step
-
-                player["staminaNow"] = clamp(
-                    player["staminaNow"]
+                player["energy"] = clamp(
+                    player["energy"]
                     - (
-                        0.0008
-                        if attacking
-                        else 0.00035
+                        drain
+                        * multiplier
                     ),
                     20,
                     100,
                 )
 
-    def _make_attacking_run(
+    # ========================================================
+    # PLAYER MOVEMENT
+    # ========================================================
+
+    def _update_players(
         self,
-        player,
-        side,
+        real_seconds: float,
     ):
-        if random.random() > 0.025:
-            return
+
+        owner = self._find_ball_owner()
+
+        for side in ["home", "away"]:
+
+            team = (
+                self.home
+                if side == "home"
+                else self.away
+            )
+
+            opponent_side = (
+                "away"
+                if side == "home"
+                else "home"
+            )
+
+            for player in self._all_players(side):
+
+                target = self._calculate_target(
+                    player,
+                    team,
+                    owner,
+                    opponent_side,
+                )
+
+                player["targetX"] = target["x"]
+                player["targetY"] = target["y"]
+
+                self._move_player(
+                    player,
+                    real_seconds,
+                )
+
+    def _calculate_target(
+        self,
+        player: Dict[str, Any],
+        team: Dict[str, Any],
+        owner: Optional[Dict[str, Any]],
+        opponent_side: str,
+    ):
+
+        side = team["side"]
+
+        attacking = (
+            self.possession_team == side
+        )
+
+        role = player["role"]
+
+        base_x = player["x"]
+        base_y = player["y"]
+
+        # ----------------------------------------------------
+        # ATTACKING MOVEMENT
+        # ----------------------------------------------------
+
+        if attacking:
+
+            direction = (
+                1
+                if side == "home"
+                else -1
+            )
+
+            progression = {
+                "GK": 0,
+                "CB": 5,
+                "RB": 9,
+                "LB": 9,
+                "RWB": 12,
+                "LWB": 12,
+                "CDM": 14,
+                "CM": 18,
+                "CAM": 23,
+                "RM": 20,
+                "LM": 20,
+                "RW": 25,
+                "LW": 25,
+                "ST": 30,
+            }.get(
+                role,
+                12,
+            )
+
+            target_x = (
+                50
+                + (
+                    direction
+                    * progression
+                )
+            )
+
+            if owner and owner["side"] == side:
+
+                distance_to_owner = math.sqrt(
+                    (
+                        player["x"]
+                        - owner["x"]
+                    ) ** 2
+                    +
+                    (
+                        player["y"]
+                        - owner["y"]
+                    ) ** 2
+                )
+
+                if (
+                    role in [
+                        "ST",
+                        "RW",
+                        "LW",
+                        "CAM",
+                    ]
+                    and distance_to_owner < 25
+                ):
+                    target_x += (
+                        direction
+                        * 8
+                    )
+
+            # Wingers stay wide
+            if role in [
+                "RW",
+                "RM",
+            ]:
+                target_y = 8
+
+            elif role in [
+                "LW",
+                "LM",
+            ]:
+                target_y = 52
+
+            elif role == "ST":
+                target_y = (
+                    25
+                    + random.uniform(
+                        -7,
+                        7,
+                    )
+                )
+
+            else:
+                target_y = (
+                    base_y
+                    + random.uniform(
+                        -1.5,
+                        1.5,
+                    )
+                )
+
+            target_x = clamp(
+                target_x,
+                8,
+                92,
+            )
+
+            return {
+                "x": target_x,
+                "y": clamp(
+                    target_y,
+                    4,
+                    56,
+                ),
+            }
+
+        # ----------------------------------------------------
+        # DEFENSIVE MOVEMENT
+        # ----------------------------------------------------
 
         direction = (
             1
@@ -840,90 +1154,383 @@ class FootballMatch:
             else -1
         )
 
-        if player["position"] in {
-            "ST",
-            "LW",
-            "RW",
-            "AM",
-        }:
-            player["targetX"] += (
-                direction
-                * random.uniform(2, 7)
-            )
-
-            player["targetY"] += random.uniform(
-                -5,
-                5,
-            )
-
-    def _defensive_position(
-        self,
-        player,
-        side,
-    ):
-        direction = (
-            1
+        defensive_x = (
+            35
             if side == "home"
-            else -1
+            else 65
         )
 
-        ball_x = self.ball["x"]
-
-        if player["position"] == "GK":
-            player["targetX"] = (
-                4 if side == "home"
-                else 96
+        if role == "GK":
+            defensive_x = (
+                5
+                if side == "home"
+                else 95
             )
 
-            player["targetY"] = clamp(
-                self.ball["y"],
-                15,
-                45,
-            )
-            return
-
-        base = (
-            player["x"]
-            + (
-                ball_x - player["x"]
-            ) * 0.05
-        )
-
-        if player["position"] in {
+        elif role in [
             "CB",
-            "LB",
             "RB",
-        }:
-            player["targetX"] = (
-                base
-                - direction * 1.5
+            "LB",
+            "RWB",
+            "LWB",
+        ]:
+            defensive_x = (
+                25
+                if side == "home"
+                else 75
             )
 
-        elif player["position"] in {
+        elif role in [
+            "CDM",
             "CM",
-            "DM",
-        }:
-            player["targetX"] = (
-                base
-                + direction * 2
+        ]:
+            defensive_x = (
+                33
+                if side == "home"
+                else 67
             )
 
-    # ---------------------------------------------------------
+        if owner:
+            if side == "home":
+                defensive_y = owner["y"]
+            else:
+                defensive_y = owner["y"]
+        else:
+            defensive_y = base_y
+
+        # Press close to ball
+        pressing = team["tactics"].get(
+            "pressing",
+            "medium",
+        )
+
+        if pressing == "high":
+            defensive_x += (
+                direction
+                * 5
+            )
+
+        return {
+            "x": clamp(
+                defensive_x,
+                4,
+                96,
+            ),
+            "y": clamp(
+                defensive_y
+                + random.uniform(
+                    -5,
+                    5,
+                ),
+                4,
+                56,
+            ),
+        }
+
+    def _move_player(
+        self,
+        player: Dict[str, Any],
+        real_seconds: float,
+    ):
+
+        dx = (
+            player["targetX"]
+            - player["x"]
+        )
+
+        dy = (
+            player["targetY"]
+            - player["y"]
+        )
+
+        dist = math.sqrt(
+            dx * dx
+            + dy * dy
+        )
+
+        if dist < 0.1:
+            return
+
+        pace_factor = (
+            0.018
+            * (
+                0.75
+                + player["pace"]
+                / 100
+            )
+        )
+
+        speed = (
+            pace_factor
+            * real_seconds
+            * 10
+        )
+
+        ratio = min(
+            1,
+            speed / dist,
+        )
+
+        player["x"] += dx * ratio
+        player["y"] += dy * ratio
+
+        player["x"] = clamp(
+            player["x"],
+            2,
+            98,
+        )
+
+        player["y"] = clamp(
+            player["y"],
+            2,
+            58,
+        )
+
+    # ========================================================
+    # BALL UPDATE
+    # ========================================================
+
+    def _update_ball(
+        self,
+        real_seconds: float,
+    ):
+
+        owner = self._find_ball_owner()
+
+        if not owner:
+            self._choose_ball_winner()
+
+            return
+
+        self.ball["x"] = owner["x"]
+        self.ball["y"] = owner["y"]
+
+        owner["cooldown"] = max(
+            0,
+            owner["cooldown"]
+            - real_seconds,
+        )
+
+        if owner["cooldown"] > 0:
+            return
+
+        self._decide_action(
+            owner
+        )
+
+    # ========================================================
+    # DECISION SYSTEM
+    # ========================================================
+
+    def _decide_action(
+        self,
+        player: Dict[str, Any],
+    ):
+
+        side = player["side"]
+
+        team = (
+            self.home
+            if side == "home"
+            else self.away
+        )
+
+        opponent_side = (
+            "away"
+            if side == "home"
+            else "home"
+        )
+
+        goal_x = (
+            100
+            if side == "home"
+            else 0
+        )
+
+        distance_to_goal = abs(
+            goal_x
+            - player["x"]
+        )
+
+        pressure = self._pressure(
+            player,
+            opponent_side,
+        )
+
+        role = player["role"]
+
+        # ----------------------------------------------------
+        # SHOOT
+        # ----------------------------------------------------
+
+        shooting_distance = (
+            role in [
+                "ST",
+                "RW",
+                "LW",
+                "CAM",
+            ]
+            and distance_to_goal <= 25
+        )
+
+        if shooting_distance:
+
+            shot_probability = (
+                0.30
+                + (
+                    player["shooting"]
+                    / 500
+                )
+            )
+
+            if pressure > 3:
+                shot_probability *= 0.72
+
+            if random.random() < shot_probability:
+                self._shoot(
+                    player
+                )
+
+                return
+
+        # ----------------------------------------------------
+        # CROSS
+        # ----------------------------------------------------
+
+        wide_area = (
+            player["y"] <= 10
+            or player["y"] >= 50
+        )
+
+        if (
+            wide_area
+            and distance_to_goal <= 38
+            and role in [
+                "RW",
+                "LW",
+                "RM",
+                "LM",
+                "RWB",
+                "LWB",
+            ]
+        ):
+
+            if random.random() < 0.30:
+                self._cross(
+                    player
+                )
+
+                return
+
+        # ----------------------------------------------------
+        # DRIBBLE
+        # ----------------------------------------------------
+
+        if (
+            pressure < 5
+            and player["dribbling"] >= 55
+            and random.random()
+            < 0.42
+        ):
+
+            self._dribble(
+                player
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # THROUGH BALL
+        # ----------------------------------------------------
+
+        if (
+            player["vision"] >= 60
+            and random.random() < 0.22
+        ):
+
+            if self._through_ball(
+                player
+            ):
+                return
+
+        # ----------------------------------------------------
+        # NORMAL PASS
+        # ----------------------------------------------------
+
+        self._pass(
+            player
+        )
+
+    # ========================================================
+    # PRESSURE
+    # ========================================================
+
+    def _pressure(
+        self,
+        player: Dict[str, Any],
+        opponent_side: str,
+    ) -> float:
+
+        opponents = self._all_players(
+            opponent_side
+        )
+
+        if not opponents:
+            return 99
+
+        return min(
+            distance(
+                player,
+                opponent,
+            )
+            for opponent in opponents
+        )
+
+    # ========================================================
+    # FIND BALL OWNER
+    # ========================================================
+
+    def _find_ball_owner(self):
+
+        owner_id = self.ball.get(
+            "owner"
+        )
+
+        if not owner_id:
+            return None
+
+        for side in [
+            "home",
+            "away",
+        ]:
+
+            player = self._find_player(
+                side,
+                owner_id,
+            )
+
+            if player and player.get(
+                "hasBall"
+            ):
+                return player
+
+        return None
+
+    # ========================================================
     # PASS
-    # ---------------------------------------------------------
+    # ========================================================
 
     def _pass(
         self,
-        player,
-        team,
-        opponent,
-        side,
+        player: Dict[str, Any],
     ):
+
+        side = player["side"]
+
         teammates = [
             p
-            for p in team["players"]
+            for p in self._all_players(side)
             if p["id"] != player["id"]
-            and not p["red"]
         ]
 
         if not teammates:
@@ -937,133 +1544,187 @@ class FootballMatch:
 
         candidates = []
 
-        for target in teammates:
-            dx = target["x"] - player["x"]
-            dy = target["y"] - player["y"]
+        for teammate in teammates:
 
-            distance = (
-                dx * dx
-                + dy * dy
-            ) ** 0.5
+            d = distance(
+                player,
+                teammate,
+            )
 
-            if distance > 35:
+            if d > 38:
                 continue
 
             progress = (
-                dx * direction
-            )
+                teammate["x"]
+                - player["x"]
+            ) * direction
 
             score = (
-                target["vision"] * 0.3
-                + target["pace"] * 0.1
-                + progress * 1.4
-                - distance * 0.4
+                progress * 1.7
+                + teammate["vision"]
+                * 0.1
+                - d * 0.45
             )
 
+            # Prefer forward players
+            if teammate["role"] in [
+                "ST",
+                "RW",
+                "LW",
+                "CAM",
+            ]:
+                score += 7
+
             candidates.append(
-                (score, target)
+                (
+                    score,
+                    teammate,
+                )
             )
 
         if not candidates:
+            teammate = min(
+                teammates,
+                key=lambda p: distance(
+                    player,
+                    p,
+                ),
+            )
+        else:
+            candidates.sort(
+                key=lambda item: item[0],
+                reverse=True,
+            )
+
+            teammate = candidates[0][1]
+
+        success_chance = (
+            0.70
+            + (
+                player["passing"]
+                - 70
+            ) / 250
+        )
+
+        success_chance -= (
+            self._pressure(
+                player,
+                "away"
+                if side == "home"
+                else "home",
+            )
+            < 5
+        ) * 0.10
+
+        success_chance = clamp(
+            success_chance,
+            0.35,
+            0.95,
+        )
+
+        player["stats"]["passes"] += 1
+
+        self._team_stats(side)[
+            "passes"
+        ] += 1
+
+        if random.random() > success_chance:
+
+            self._event(
+                "bad_pass",
+                f"{player['name']} lost the ball",
+                side,
+                player["id"],
+            )
+
+            self._lose_ball_to_opponent(
+                player
+            )
+
+            player["cooldown"] = 0.7
+
             return
 
-        candidates.sort(
-            key=lambda x: x[0],
-            reverse=True,
+        player["stats"][
+            "passesCompleted"
+        ] += 1
+
+        self._team_stats(side)[
+            "passesCompleted"
+        ] += 1
+
+        self._give_ball(
+            teammate,
+            side,
         )
 
-        target = candidates[0][1]
+        teammate["action"] = "receive"
 
-        success = (
-            random.random()
-            <
-            clamp(
-                (
-                    player["passing"]
-                    + player["vision"]
-                    - self._pressure(
-                        player,
-                        opponent,
-                    ) * 30
-                )
-                / 120,
-                0.55,
-                0.96,
-            )
+        # Forward pass gets a little attacking push
+        direction = (
+            1
+            if side == "home"
+            else -1
         )
 
-        player["passes"] += 1
-        self.stats[side]["passes"] += 1
+        if (
+            teammate["role"]
+            in [
+                "ST",
+                "RW",
+                "LW",
+                "CAM",
+            ]
+        ):
 
-        if success:
-            player["completedPasses"] += 1
-            self.stats[side][
-                "completedPasses"
-            ] += 1
-
-            self.ball.update(
-                {
-                    "x": target["x"],
-                    "y": target["y"],
-                    "ownerId": target["id"],
-                    "ownerSide": side,
-                    "state": "pass",
-                    "targetId": target["id"],
-                }
+            teammate["targetX"] = clamp(
+                teammate["x"]
+                + direction * 5,
+                5,
+                95,
             )
 
-            player["hasBall"] = False
-            target["hasBall"] = True
-            target["lastAction"] = "received pass"
+        self._event(
+            "pass",
+            f"{player['name']} passed to {teammate['name']}",
+            side,
+            player["id"],
+            extra={
+                "receiverId": teammate["id"],
+                "receiver": teammate["name"],
+            },
+        )
 
-            self._event(
-                self.minute,
-                "pass",
-                f"{player['name']} passed to {target['name']}",
-                side,
-                player["id"],
-                target["id"],
-            )
+        player["cooldown"] = (
+            0.6
+            + random.random()
+            * 0.8
+        )
 
-        else:
-            self._event(
-                self.minute,
-                "missed_pass",
-                f"{player['name']} misplaced the pass",
-                side,
-                player["id"],
-            )
-
-            self._free_ball(
-                player["x"],
-                player["y"],
-            )
-
-    # ---------------------------------------------------------
+    # ========================================================
     # THROUGH BALL
-    # ---------------------------------------------------------
+    # ========================================================
 
     def _through_ball(
         self,
-        player,
-        team,
-        opponent,
-        side,
-    ):
-        attackers = [
+        player: Dict[str, Any],
+    ) -> bool:
+
+        side = player["side"]
+
+        teammates = [
             p
-            for p in team["players"]
-            if p["position"]
-            in {
+            for p in self._all_players(side)
+            if p["id"] != player["id"]
+            and p["role"] in [
                 "ST",
-                "LW",
                 "RW",
-                "AM",
-            }
-            and p["id"] != player["id"]
+                "LW",
+                "CAM",
+            ]
         ]
 
-        if not attackers:
+        if not teammates:
             return False
 
         direction = (
@@ -1072,587 +1733,799 @@ class FootballMatch:
             else -1
         )
 
-        candidates = []
+        forward = [
+            p
+            for p in teammates
+            if (
+                p["x"] - player["x"]
+            ) * direction > 3
+        ]
 
-        for target in attackers:
-            progress = (
-                target["x"] - player["x"]
-            ) * direction
-
-            if progress < 2:
-                continue
-
-            candidates.append(target)
-
-        if not candidates:
+        if not forward:
             return False
 
-        target = random.choice(
-            candidates
+        target = max(
+            forward,
+            key=lambda p: (
+                (
+                    p["x"]
+                    - player["x"]
+                )
+                * direction
+            )
+            + p["pace"] * 0.1,
+        )
+
+        chance = (
+            0.48
+            + (
+                player["vision"]
+                - 60
+            ) / 180
         )
 
         chance = clamp(
-            (
-                player["passing"]
-                + player["vision"]
-            ) / 190,
-            0.45,
-            0.9,
+            chance,
+            0.25,
+            0.85,
         )
 
-        if random.random() > chance:
-            return False
+        player["stats"]["passes"] += 1
+        self._team_stats(side)["passes"] += 1
 
-        target["targetX"] += (
-            direction
-            * random.uniform(4, 9)
+        if random.random() > chance:
+
+            self._event(
+                "through_ball_failed",
+                f"{player['name']} tried a through ball but it was intercepted",
+                side,
+                player["id"],
+            )
+
+            self._lose_ball_to_opponent(
+                player
+            )
+
+            player["cooldown"] = 1.0
+
+            return True
+
+        player["stats"][
+            "passesCompleted"
+        ] += 1
+
+        self._team_stats(side)[
+            "passesCompleted"
+        ] += 1
+
+        self._give_ball(
+            target,
+            side,
         )
 
         target["targetX"] = clamp(
-            target["targetX"],
-            3,
-            97,
+            target["x"]
+            + direction * 10,
+            5,
+            95,
         )
 
-        self.ball.update(
-            {
-                "x": target["x"],
-                "y": target["y"],
-                "ownerId": target["id"],
-                "ownerSide": side,
-                "state": "through_ball",
-                "targetId": target["id"],
-            }
-        )
-
-        player["hasBall"] = False
-        target["hasBall"] = True
-
-        self.stats[side]["passes"] += 1
+        target["action"] = "run"
 
         self._event(
-            self.minute,
             "through_ball",
-            f"{player['name']} played a through ball to {target['name']}",
+            f"{player['name']} sent a through ball to {target['name']}",
             side,
             player["id"],
-            target["id"],
+            extra={
+                "receiverId": target["id"],
+                "receiver": target["name"],
+            },
         )
+
+        player["cooldown"] = 1.0
 
         return True
 
-    # ---------------------------------------------------------
+    # ========================================================
     # DRIBBLE
-    # ---------------------------------------------------------
+    # ========================================================
 
     def _dribble(
         self,
-        player,
-        side,
+        player: Dict[str, Any],
     ):
+
+        side = player["side"]
+
         direction = (
             1
             if side == "home"
             else -1
         )
 
-        player["targetX"] += (
-            direction
-            * random.uniform(2, 6)
+        opponent_side = (
+            "away"
+            if side == "home"
+            else "home"
         )
 
-        player["targetY"] += random.uniform(
-            -3,
-            3,
+        closest = None
+
+        opponents = self._all_players(
+            opponent_side
         )
 
-        player["targetX"] = clamp(
-            player["targetX"],
-            2,
-            98,
+        if opponents:
+
+            closest = min(
+                opponents,
+                key=lambda p: distance(
+                    player,
+                    p,
+                ),
+            )
+
+        success = (
+            0.50
+            + (
+                player["dribbling"]
+                - 65
+            ) / 150
         )
 
-        player["targetY"] = clamp(
-            player["targetY"],
-            3,
-            57,
-        )
+        if closest:
 
-        self.ball["x"] = player["x"]
-        self.ball["y"] = player["y"]
+            success -= max(
+                0,
+                (
+                    6
+                    - distance(
+                        player,
+                        closest,
+                    )
+                )
+                * 0.035,
+            )
 
-        player["lastAction"] = "dribbling"
-
-        self._event(
-            self.minute,
-            "dribble",
-            f"{player['name']} is dribbling forward",
-            side,
-            player["id"],
-        )
-
-    # ---------------------------------------------------------
-    # SHOT
-    # ---------------------------------------------------------
-
-    def _should_shoot(
-        self,
-        player,
-        pressure,
-    ):
-        base = (
-            player["shooting"]
-            / 100
-        )
-
-        if pressure > 0.7:
-            base -= 0.15
-
-        return random.random() < clamp(
-            base,
+        success = clamp(
+            success,
             0.20,
-            0.90,
+            0.85,
         )
 
-    def _attempt_shot(
+        player["stats"]["dribbles"] += 1
+
+        if random.random() < success:
+
+            player["x"] = clamp(
+                player["x"]
+                + direction
+                * random.uniform(
+                    2,
+                    6,
+                ),
+                3,
+                97,
+            )
+
+            player["y"] = clamp(
+                player["y"]
+                + random.uniform(
+                    -3,
+                    3,
+                ),
+                3,
+                57,
+            )
+
+            player["action"] = "dribble"
+
+            self._event(
+                "dribble",
+                f"{player['name']} beat a defender",
+                side,
+                player["id"],
+            )
+
+        else:
+
+            self._event(
+                "tackle",
+                f"{player['name']} lost the ball under pressure",
+                opponent_side,
+                closest["id"]
+                if closest
+                else None,
+            )
+
+            if closest:
+
+                closest["stats"][
+                    "tackles"
+                ] += 1
+
+                self._team_stats(
+                    opponent_side
+                )["tackles"] += 1
+
+                self._give_ball(
+                    closest,
+                    opponent_side,
+                )
+
+            else:
+                self._lose_ball_to_opponent(
+                    player
+                )
+
+        player["cooldown"] = 0.8
+
+    # ========================================================
+    # SHOOT
+    # ========================================================
+
+    def _shoot(
         self,
-        player,
-        team,
-        side,
+        player: Dict[str, Any],
     ):
+
+        side = player["side"]
+
+        opponent_side = (
+            "away"
+            if side == "home"
+            else "home"
+        )
+
+        team = (
+            self.home
+            if side == "home"
+            else self.away
+        )
+
         opponent = (
             self.away
             if side == "home"
             else self.home
         )
 
-        player["shots"] += 1
-        self.stats[side]["shots"] += 1
-
-        distance = self._goal_distance(
-            player,
-            side,
+        direction = (
+            1
+            if side == "home"
+            else -1
         )
 
-        accuracy = clamp(
-            (
-                player["shooting"]
-                * 0.65
-                + player["vision"] * 0.15
-                + player["dribbling"] * 0.1
-            )
-            / 100,
+        goal_x = (
+            100
+            if side == "home"
+            else 0
+        )
+
+        distance_to_goal = abs(
+            goal_x
+            - player["x"]
+        )
+
+        angle_factor = clamp(
+            1
+            - abs(
+                player["y"]
+                - 30
+            ) / 40,
+            0.55,
+            1.0,
+        )
+
+        distance_factor = clamp(
+            1
+            - (
+                distance_to_goal
+                / 45
+            ),
             0.35,
-            0.94,
+            1.0,
         )
 
-        distance_penalty = clamp(
-            distance / 100,
-            0,
-            0.45,
+        shot_quality = (
+            player["shooting"]
+            * 0.55
+            + player["composure"]
+            if "composure" in player
+            else player["shooting"] * 0.65
         )
 
-        on_target_chance = clamp(
-            accuracy - distance_penalty,
-            0.25,
-            0.90,
+        shot_quality *= angle_factor
+        shot_quality *= distance_factor
+
+        goalkeeper = next(
+            (
+                p
+                for p in opponent["players"]
+                if p["active"]
+                and p["role"] == "GK"
+            ),
+            None,
+        )
+
+        if goalkeeper is None:
+            goalkeeper = opponent["players"][0]
+
+        save_power = (
+            goalkeeper["goalkeeping"]
+            * 0.60
+        )
+
+        goal_probability = (
+            0.08
+            + (
+                shot_quality
+                - save_power
+            ) / 170
+        )
+
+        goal_probability = clamp(
+            goal_probability,
+            0.03,
+            0.65,
+        )
+
+        player["stats"]["shots"] += 1
+
+        team["stats"]["shots"] += 1
+
+        self._team_stats(side)[
+            "shots"
+        ] += 1
+
+        on_target_probability = (
+            0.48
+            + player["shooting"]
+            / 300
         )
 
         on_target = (
             random.random()
-            < on_target_chance
+            < on_target_probability
         )
 
-        player["hasBall"] = False
+        if on_target:
 
-        if not on_target:
-            self._event(
-                self.minute,
-                "shot",
-                f"{player['name']} shot wide",
-                side,
-                player["id"],
-            )
+            player["stats"][
+                "shotsOnTarget"
+            ] += 1
 
-            self._free_ball(
-                player["x"],
-                player["y"],
-            )
+            team["stats"][
+                "shotsOnTarget"
+            ] = team["stats"].get(
+                "shotsOnTarget",
+                0,
+            ) + 1
 
-            return
+            self._team_stats(side)[
+                "shotsOnTarget"
+            ] += 1
 
-        self.stats[side][
-            "shotsOnTarget"
-        ] += 1
-
-        goalkeeper = self._goalkeeper(
-            opponent
+        self._event(
+            "shot",
+            f"{player['name']} took a shot",
+            side,
+            player["id"],
+            extra={
+                "onTarget": on_target,
+            },
         )
 
-        save_power = (
-            goalkeeper["goalkeeping"]
-            if goalkeeper
-            else 65
-        )
+        if on_target and random.random() < goal_probability:
 
-        goal_chance = clamp(
-            (
-                player["shooting"]
-                - save_power * 0.55
-                + random.uniform(-15, 15)
-            ) / 100,
-            0.08,
-            0.72,
-        )
-
-        if random.random() < goal_chance:
             self._goal(
-                player,
-                side,
+                player
             )
-        else:
-            if goalkeeper:
-                goalkeeper["saves"] += 1
 
-                self.stats[
-                    "away"
-                    if side == "home"
-                    else "home"
-                ]["saves"] += 1
+        elif on_target:
 
-                self._event(
-                    self.minute,
-                    "save",
-                    f"{goalkeeper['name']} saved a shot from {player['name']}",
-                    "away"
-                    if side == "home"
-                    else "home",
-                    goalkeeper["id"],
-                    player["id"],
+            goalkeeper["stats"][
+                "saves"
+            ] += 1
+
+            self._team_stats(
+                opponent_side
+            )["saves"] += 1
+
+            opponent["stats"][
+                "saves"
+            ] = opponent["stats"].get(
+                "saves",
+                0,
+            ) + 1
+
+            self._event(
+                "save",
+                f"{goalkeeper['name']} made a save",
+                opponent_side,
+                goalkeeper["id"],
+            )
+
+            # Sometimes save goes for corner
+            if random.random() < 0.22:
+
+                self._corner(
+                    side,
+                    goalkeeper,
                 )
 
             else:
-                self._event(
-                    self.minute,
-                    "shot",
-                    f"{player['name']} shot on target",
-                    side,
-                    player["id"],
+
+                self._lose_ball_to_opponent(
+                    goalkeeper,
+                    new_side=opponent_side,
                 )
 
-            self._free_ball(
-                goalkeeper["x"]
-                if goalkeeper
-                else player["x"],
-                goalkeeper["y"]
-                if goalkeeper
-                else player["y"],
-            )
-
-    # ---------------------------------------------------------
-    # GOAL
-    # ---------------------------------------------------------
-
-    def _goal(
-        self,
-        player,
-        side,
-    ):
-        self.score[side] += 1
-
-        player["goals"] += 1
-
-        self._event(
-            self.minute,
-            "goal",
-            f"GOAL! {player['name']} scored for {self._team_name(side)}",
-            side,
-            player["id"],
-        )
-
-        self.ball.update(
-            {
-                "x": 50,
-                "y": 30,
-                "ownerId": None,
-                "ownerSide": None,
-                "state": "goal",
-                "targetId": None,
-            }
-        )
-
-        for team_side, team in [
-            ("home", self.home),
-            ("away", self.away),
-        ]:
-            for p in team["players"]:
-                p["hasBall"] = False
-
-        self._reset_after_goal()
-
-    def _reset_after_goal(self):
-        for side, team in [
-            ("home", self.home),
-            ("away", self.away),
-        ]:
-            self._apply_formation(
-                team["players"],
-                team["formation"],
-                side == "home",
-            )
-
-        if self.score["home"] <= self.score["away"]:
-            kickoff_side = "home"
         else:
-            kickoff_side = "away"
 
-        team = (
-            self.home
-            if kickoff_side == "home"
-            else self.away
-        )
+            # Miss can lead to goal kick
+            self._event(
+                "shot_missed",
+                f"{player['name']} missed the target",
+                side,
+                player["id"],
+            )
 
-        midfielders = [
-            p
-            for p in team["players"]
-            if p["position"]
-            in {
-                "CM",
-                "AM",
-                "ST",
-            }
-        ]
+            self._goal_kick(
+                opponent_side
+            )
 
-        player = (
-            random.choice(midfielders)
-            if midfielders
-            else team["players"][0]
-        )
+        player["cooldown"] = 1.4
 
-        self.ball.update(
-            {
-                "x": 50,
-                "y": 30,
-                "ownerId": player["id"],
-                "ownerSide": kickoff_side,
-                "state": "kickoff",
-                "targetId": None,
-            }
-        )
-
-        player["hasBall"] = True
-
-    # ---------------------------------------------------------
+    # ========================================================
     # CROSS
-    # ---------------------------------------------------------
+    # ========================================================
 
     def _cross(
         self,
-        player,
-        team,
-        opponent,
-        side,
+        player: Dict[str, Any],
     ):
-        targets = [
-            p
-            for p in team["players"]
-            if p["position"]
-            in {
-                "ST",
-                "AM",
-            }
-            and p["id"] != player["id"]
-        ]
 
-        if not targets:
-            return
+        side = player["side"]
 
-        target = min(
-            targets,
-            key=lambda p: abs(
-                p["x"]
-                - (
-                    82
-                    if side == "home"
-                    else 18
-                )
-            ),
-        )
-
-        self.stats[side]["passes"] += 1
-
-        success = random.random() < 0.70
-
-        if success:
-            self.ball.update(
-                {
-                    "x": target["x"],
-                    "y": target["y"],
-                    "ownerId": target["id"],
-                    "ownerSide": side,
-                    "state": "cross",
-                    "targetId": target["id"],
-                }
-            )
-
-            player["hasBall"] = False
-            target["hasBall"] = True
-
-            self._event(
-                self.minute,
-                "cross",
-                f"{player['name']} crossed into the box",
-                side,
-                player["id"],
-                target["id"],
-            )
-
-        else:
-            self._corner(
-                side,
-                player,
-            )
-
-    # ---------------------------------------------------------
-    # CORNER
-    # ---------------------------------------------------------
-
-    def _corner(
-        self,
-        side,
-        player=None,
-    ):
-        self.stats[side]["corners"] += 1
-
-        name = (
-            player["name"]
-            if player
-            else self._team_name(side)
-        )
-
-        self._event(
-            self.minute,
-            "corner",
-            f"Corner for {self._team_name(side)}",
-            side,
-            player["id"]
-            if player
-            else None,
-        )
-
-        attacking = (
-            self.home
+        opponent_side = (
+            "away"
             if side == "home"
-            else self.away
+            else "home"
         )
 
         attackers = [
             p
-            for p in attacking["players"]
-            if p["position"]
-            in {
+            for p in self._all_players(side)
+            if p["role"] in [
                 "ST",
-                "AM",
-                "LW",
+                "CAM",
                 "RW",
-            }
+                "LW",
+            ]
         ]
 
-        if attackers:
+        if not attackers:
+            return
+
+        target = min(
+            attackers,
+            key=lambda p: distance(
+                player,
+                p,
+            ),
+        )
+
+        success = (
+            0.45
+            + (
+                player["passing"]
+                - 60
+            ) / 160
+        )
+
+        if random.random() > success:
+
+            self._event(
+                "cross_failed",
+                f"{player['name']} sent a poor cross",
+                side,
+                player["id"],
+            )
+
+            self._lose_ball_to_opponent(
+                player
+            )
+
+            player["cooldown"] = 1.0
+
+            return
+
+        self._give_ball(
+            target,
+            side,
+        )
+
+        self._event(
+            "cross",
+            f"{player['name']} crossed for {target['name']}",
+            side,
+            player["id"],
+            extra={
+                "receiverId": target["id"],
+                "receiver": target["name"],
+            },
+        )
+
+        # Header / quick shot after cross
+        if random.random() < 0.50:
+
+            target["cooldown"] = 0.1
+
+            self._shoot(
+                target
+            )
+
+        player["cooldown"] = 1.0
+
+    # ========================================================
+    # GOAL
+    # ========================================================
+
+    def _goal(
+        self,
+        scorer: Dict[str, Any],
+    ):
+
+        side = scorer["side"]
+
+        self.score[side] += 1
+
+        self._team_stats(
+            side
+        )["goals"] += 1
+
+        scorer["stats"][
+            "goals"
+        ] += 1
+
+        scorer["action"] = "goal"
+
+        self._event(
+            "goal",
+            f"GOAL! {scorer['name']} scored for {self._team(side)['name']}",
+            side,
+            scorer["id"],
+            extra={
+                "scorer": scorer["name"],
+                "score": self.score.copy(),
+            },
+        )
+
+        self.ball["state"] = "goal"
+
+        self._reset_after_goal(
+            opposite_side=(
+                "away"
+                if side == "home"
+                else "home"
+            )
+        )
+
+    def _reset_after_goal(
+        self,
+        opposite_side: str,
+    ):
+
+        self._clear_ball()
+
+        team = self._team(
+            opposite_side
+        )
+
+        player = self._find_best_player(
+            team,
+            [
+                "CM",
+                "CAM",
+                "CDM",
+            ],
+        )
+
+        if not player:
+            player = team["players"][0]
+
+        player["x"] = (
+            50
+            if opposite_side == "home"
+            else 50
+        )
+
+        player["y"] = 30
+
+        self._give_ball(
+            player,
+            opposite_side,
+        )
+
+        self.attack_team = opposite_side
+
+    # ========================================================
+    # CORNER
+    # ========================================================
+
+    def _corner(
+        self,
+        side: str,
+        goalkeeper: Optional[Dict[str, Any]] = None,
+    ):
+
+        if time.time() < self.cooldowns[
+            "corner"
+        ][side]:
+            return
+
+        self.cooldowns[
+            "corner"
+        ][side] = (
+            time.time()
+            + 2
+        )
+
+        self._team_stats(
+            side
+        )["corners"] += 1
+
+        team = self._team(side)
+
+        taker = self._find_best_player(
+            team,
+            [
+                "RW",
+                "LW",
+                "RM",
+                "LM",
+                "CAM",
+            ],
+        )
+
+        if not taker:
+            taker = team["players"][0]
+
+        taker["stats"][
+            "corners"
+        ] += 1
+
+        self._event(
+            "corner",
+            f"Corner kick for {team['name']}",
+            side,
+            taker["id"],
+        )
+
+        attackers = [
+            p
+            for p in self._all_players(side)
+            if p["role"] in [
+                "ST",
+                "CB",
+                "CAM",
+            ]
+        ]
+
+        if attackers and random.random() < 0.65:
+
             target = random.choice(
                 attackers
             )
 
-            self.ball.update(
-                {
-                    "x": (
-                        88
-                        if side == "home"
-                        else 12
-                    ),
-                    "y": random.choice(
-                        [3, 57]
-                    ),
-                    "ownerId": target["id"],
-                    "ownerSide": side,
-                    "state": "corner",
-                    "targetId": target["id"],
-                }
+            self._give_ball(
+                target,
+                side,
             )
 
-    # ---------------------------------------------------------
-    # DEFENDING
-    # ---------------------------------------------------------
+            if random.random() < 0.35:
+                self._shoot(
+                    target
+                )
 
-    def _pressure(
+    # ========================================================
+    # GOAL KICK
+    # ========================================================
+
+    def _goal_kick(
         self,
-        player,
-        opponent,
+        side: str,
     ):
-        defenders = [
-            p
-            for p in opponent["players"]
-            if not p["red"]
-        ]
 
-        if not defenders:
-            return 0
+        team = self._team(side)
 
-        nearest = min(
-            defenders,
-            key=lambda p: (
-                (
-                    p["x"] - player["x"]
-                ) ** 2
-                + (
-                    p["y"] - player["y"]
-                ) ** 2
+        goalkeeper = next(
+            (
+                p
+                for p in team["players"]
+                if p["active"]
+                and p["role"] == "GK"
+            ),
+            None,
+        )
+
+        if not goalkeeper:
+            goalkeeper = team["players"][0]
+
+        self._give_ball(
+            goalkeeper,
+            side,
+        )
+
+        self._event(
+            "goal_kick",
+            f"Goal kick for {team['name']}",
+            side,
+            goalkeeper["id"],
+        )
+
+    # ========================================================
+    # BALL LOSS
+    # ========================================================
+
+    def _lose_ball_to_opponent(
+        self,
+        player: Dict[str, Any],
+        new_side: Optional[str] = None,
+    ):
+
+        side = new_side
+
+        if side is None:
+            side = (
+                "away"
+                if player["side"] == "home"
+                else "home"
+            )
+
+        opponents = self._all_players(
+            side
+        )
+
+        if not opponents:
+            self._clear_ball()
+            return
+
+        closest = min(
+            opponents,
+            key=lambda p: distance(
+                player,
+                p,
             ),
         )
 
-        distance = (
-            (
-                nearest["x"]
-                - player["x"]
-            ) ** 2
-            + (
-                nearest["y"]
-                - player["y"]
-            ) ** 2
-        ) ** 0.5
-
-        return clamp(
-            1 - distance / 15,
-            0,
-            1,
+        self._give_ball(
+            closest,
+            side,
         )
 
-    def _recover_ball_if_needed(self):
-        if self.ball["ownerId"]:
-            return
+        self.possession_team = side
+
+    def _choose_ball_winner(self):
 
         candidates = []
 
-        for side, team in [
-            ("home", self.home),
-            ("away", self.away),
+        for side in [
+            "home",
+            "away",
         ]:
-            for player in team["players"]:
-                distance = (
-                    (
-                        player["x"]
-                        - self.ball["x"]
-                    ) ** 2
-                    + (
-                        player["y"]
-                        - self.ball["y"]
-                    ) ** 2
-                ) ** 0.5
+
+            for player in self._all_players(
+                side
+            ):
 
                 candidates.append(
                     (
-                        distance,
-                        side,
+                        distance(
+                            player,
+                            self.ball,
+                        ),
                         player,
                     )
                 )
@@ -1664,394 +2537,788 @@ class FootballMatch:
             key=lambda x: x[0]
         )
 
-        distance, side, player = candidates[0]
+        player = candidates[0][1]
 
-        if distance < 7:
-            self.ball["ownerId"] = player["id"]
-            self.ball["ownerSide"] = side
-            self.ball["state"] = "controlled"
-            player["hasBall"] = True
+        self._give_ball(
+            player,
+            player["side"],
+        )
 
-            self._event(
-                self.minute,
-                "recovery",
-                f"{player['name']} recovered the ball",
-                side,
-                player["id"],
+    # ========================================================
+    # RANDOM EVENTS
+    # ========================================================
+
+    def _maybe_random_event(self):
+
+        # Tackle/interception
+        if random.random() < 0.025:
+
+            self._maybe_tackle()
+
+        # Foul
+        if random.random() < 0.008:
+
+            self._maybe_foul()
+
+        # Possession update
+        self._update_possession_stats()
+
+    def _maybe_tackle(self):
+
+        owner = self._find_ball_owner()
+
+        if not owner:
+            return
+
+        opponent_side = (
+            "away"
+            if owner["side"] == "home"
+            else "home"
+        )
+
+        defenders = self._all_players(
+            opponent_side
+        )
+
+        if not defenders:
+            return
+
+        defender = min(
+            defenders,
+            key=lambda p: distance(
+                p,
+                owner,
+            ),
+        )
+
+        d = distance(
+            defender,
+            owner,
+        )
+
+        if d > 4:
+            return
+
+        tackle_probability = (
+            0.35
+            + defender["defending"]
+            / 300
+        )
+
+        if random.random() < tackle_probability:
+
+            defender["stats"][
+                "tackles"
+            ] += 1
+
+            self._team_stats(
+                opponent_side
+            )["tackles"] += 1
+
+            self._give_ball(
+                defender,
+                opponent_side,
             )
 
-    def _free_ball(
-        self,
-        x,
-        y,
-    ):
-        self.ball.update(
-            {
-                "x": clamp(x, 1, 99),
-                "y": clamp(y, 1, 59),
-                "ownerId": None,
-                "ownerSide": None,
-                "state": "free",
-                "targetId": None,
-            }
+            self._event(
+                "tackle",
+                f"{defender['name']} won the ball",
+                opponent_side,
+                defender["id"],
+            )
+
+        else:
+
+            owner["stats"][
+                "fouled"
+            ] += 1
+
+    def _maybe_foul(self):
+
+        owner = self._find_ball_owner()
+
+        if not owner:
+            return
+
+        opponent_side = (
+            "away"
+            if owner["side"] == "home"
+            else "home"
         )
 
-    # ---------------------------------------------------------
-    # BALL
-    # ---------------------------------------------------------
+        defenders = self._all_players(
+            opponent_side
+        )
 
-    def _move_ball(self):
-        owner = self._get_ball_owner()
+        if not defenders:
+            return
+
+        defender = min(
+            defenders,
+            key=lambda p: distance(
+                p,
+                owner,
+            ),
+        )
+
+        if distance(
+            defender,
+            owner,
+        ) > 5:
+            return
+
+        if random.random() < 0.35:
+
+            defender["stats"][
+                "fouls"
+            ] += 1
+
+            self._team_stats(
+                opponent_side
+            )["fouls"] += 1
+
+            self._event(
+                "foul",
+                f"Foul by {defender['name']}",
+                opponent_side,
+                defender["id"],
+            )
+
+            self._give_ball(
+                owner,
+                owner["side"],
+            )
+
+    # ========================================================
+    # POSSESSION
+    # ========================================================
+
+    def _update_possession_stats(self):
+
+        home_count = 0
+        away_count = 0
+
+        owner = self._find_ball_owner()
 
         if owner:
-            self.ball["x"] = owner["x"]
-            self.ball["y"] = owner["y"]
 
-    def _get_ball_owner(self):
-        owner_id = self.ball.get(
-            "ownerId"
+            if owner["side"] == "home":
+                home_count = 1
+            else:
+                away_count = 1
+
+        current = self._team_stats(
+            self.possession_team
         )
 
-        if not owner_id:
-            return None
+        other_side = (
+            "away"
+            if self.possession_team == "home"
+            else "home"
+        )
 
-        for team in [
-            self.home,
-            self.away,
-        ]:
-            for player in team["players"]:
-                if player["id"] == owner_id:
-                    return player
+        current["possession"] = clamp(
+            current.get(
+                "possession",
+                50,
+            ) + 0.05,
+            0,
+            100,
+        )
 
-        return None
+        other = self._team_stats(
+            other_side
+        )
 
-    # ---------------------------------------------------------
-    # HELPERS
-    # ---------------------------------------------------------
-
-    def _find_player(
-        self,
-        team,
-        player_id,
-    ):
-        for player in team["players"]:
-            if player["id"] == player_id:
-                return player
-
-        return None
-
-    def _goalkeeper(self, team):
-        for player in team["players"]:
-            if player["position"] == "GK":
-                return player
-
-        return team["players"][0] if team["players"] else None
-
-    def _goal_distance(
-        self,
-        player,
-        side,
-    ):
-        goal_x = (
+        other["possession"] = clamp(
             100
-            if side == "home"
-            else 0
+            - current["possession"],
+            0,
+            100,
         )
 
-        return (
-            (
-                goal_x
-                - player["x"]
-            ) ** 2
-            + (
-                30
-                - player["y"]
-            ) ** 2
-        ) ** 0.5
+    # ========================================================
+    # HALFTIME
+    # ========================================================
 
-    def _advance_player(
-        self,
-        player,
-        side,
-    ):
-        direction = (
-            1
-            if side == "home"
-            else -1
-        )
+    def _halftime(self):
 
-        player["targetX"] += (
-            direction
-            * random.uniform(3, 8)
-        )
+        self.halftime_done = True
 
-        player["targetY"] += random.uniform(
-            -4,
-            4,
-        )
-
-        player["targetX"] = clamp(
-            player["targetX"],
-            2,
-            98,
-        )
-
-        player["targetY"] = clamp(
-            player["targetY"],
-            3,
-            57,
-        )
-
-        player["lastAction"] = "attacking run"
+        self.status = "halftime"
+        self.running = False
 
         self._event(
-            self.minute,
-            "run",
-            f"{player['name']} made an attacking run",
-            side,
-            player["id"],
+            "halftime",
+            "Half time",
+            None,
+            None,
+            extra={
+                "score": self.score.copy(),
+            },
         )
 
-    def _assign_initial_ball(self):
-        player = self.home["players"][9]
-
-        self.ball.update(
-            {
-                "x": player["x"],
-                "y": player["y"],
-                "ownerId": player["id"],
-                "ownerSide": "home",
-                "state": "kickoff",
-                "targetId": None,
-            }
+        self.thread = threading.Thread(
+            target=self._auto_resume_after_halftime,
+            daemon=True,
         )
 
-        player["hasBall"] = True
+        self.thread.start()
 
-    def _team_name(self, side):
-        return (
-            self.home["name"]
-            if side == "home"
-            else self.away["name"]
+    def _auto_resume_after_halftime(self):
+
+        time.sleep(2)
+
+        with self.lock:
+
+            if (
+                not self.finished
+                and self.status == "halftime"
+            ):
+
+                self.status = "playing"
+                self.running = True
+                self.last_tick = time.time()
+
+                self._event(
+                    "second_half",
+                    "Second half started",
+                    None,
+                    None,
+                )
+
+    # ========================================================
+    # FINISH
+    # ========================================================
+
+    def _finish_match(self):
+
+        if self.finished:
+            return
+
+        self.finished = True
+        self.running = False
+        self.status = "finished"
+
+        self._clear_ball()
+
+        self._event(
+            "full_time",
+            "Full time",
+            None,
+            None,
+            extra={
+                "score": self.score.copy(),
+            },
         )
 
-    # ---------------------------------------------------------
+    def finish(self):
+
+        with self.lock:
+
+            self._finish_match()
+
+            return self.snapshot()
+
+    # ========================================================
+    # PAUSE
+    # ========================================================
+
+    def pause(self):
+
+        with self.lock:
+
+            if not self.finished:
+                self.running = False
+
+                if self.status == "playing":
+                    self.status = "paused"
+
+                self._event(
+                    "paused",
+                    "Match paused",
+                    None,
+                    None,
+                )
+
+            return self.snapshot()
+
+    # ========================================================
     # TACTICS
-    # ---------------------------------------------------------
+    # ========================================================
 
     def set_tactics(
         self,
-        side,
-        tactics,
+        side: str,
+        tactics: Dict[str, Any],
     ):
-        team = (
-            self.home
-            if side == "home"
-            else self.away
-        )
 
-        team["tactics"].update(
-            tactics or {}
-        )
+        with self.lock:
 
-        return self.snapshot()
+            team = self._team(
+                side
+            )
+
+            if not isinstance(
+                tactics,
+                dict,
+            ):
+                return self.snapshot()
+
+            team["tactics"].update(
+                self._create_tactics(
+                    tactics
+                )
+            )
+
+            self._event(
+                "tactics",
+                f"{team['name']} changed tactics",
+                side,
+                None,
+            )
+
+            return self.snapshot()
+
+    # ========================================================
+    # FORMATION
+    # ========================================================
 
     def set_formation(
         self,
-        side,
-        formation,
+        side: str,
+        formation: str,
     ):
-        if formation not in FORMATION_POSITIONS:
-            formation = "4-3-3"
 
-        team = (
-            self.home
-            if side == "home"
-            else self.away
-        )
+        with self.lock:
 
-        team["formation"] = formation
+            if formation not in FORMATIONS:
+                raise ValueError(
+                    f"Unsupported formation: {formation}"
+                )
 
-        self._apply_formation(
-            team["players"],
-            formation,
-            side == "home",
-        )
+            team = self._team(
+                side
+            )
 
-        self._event(
-            self.minute,
-            "formation",
-            f"{team['name']} changed formation to {formation}",
-            side,
-        )
+            team["formation"] = formation
 
-        return self.snapshot()
+            positions = self._formation_positions(
+                formation,
+                side,
+            )
+
+            roles = FORMATIONS[
+                formation
+            ]
+
+            for index, player in enumerate(
+                self._all_players(side)
+            ):
+
+                if index >= len(positions):
+                    break
+
+                player["role"] = roles[index]
+                player["position"] = roles[index]
+
+                player["targetX"] = positions[
+                    index
+                ]["x"]
+
+                player["targetY"] = positions[
+                    index
+                ]["y"]
+
+            self._event(
+                "formation",
+                f"{team['name']} changed formation to {formation}",
+                side,
+                None,
+            )
+
+            return self.snapshot()
+
+    # ========================================================
+    # SUBSTITUTION
+    # ========================================================
 
     def substitute(
         self,
-        side,
-        outgoing_id,
-        incoming_id,
+        side: str,
+        outgoing_id: str,
+        incoming_id: str,
     ):
-        team = (
+
+        with self.lock:
+
+            team = self._team(
+                side
+            )
+
+            if team["substitutionsUsed"] >= 5:
+
+                raise ValueError(
+                    "Maximum substitutions reached"
+                )
+
+            outgoing = self._find_player(
+                side,
+                outgoing_id,
+            )
+
+            incoming = next(
+                (
+                    p
+                    for p in team["bench"]
+                    if str(p["id"])
+                    == str(incoming_id)
+                ),
+                None,
+            )
+
+            if not outgoing:
+                raise ValueError(
+                    "Outgoing player not found"
+                )
+
+            if not incoming:
+                raise ValueError(
+                    "Incoming player not found"
+                )
+
+            incoming["active"] = True
+            incoming["isBench"] = False
+
+            incoming["x"] = outgoing["x"]
+            incoming["y"] = outgoing["y"]
+
+            outgoing["active"] = False
+            outgoing["hasBall"] = False
+
+            team["players"] = [
+                p
+                for p in team["players"]
+                if p["id"] != outgoing["id"]
+            ]
+
+            team["players"].append(
+                incoming
+            )
+
+            team["bench"] = [
+                p
+                for p in team["bench"]
+                if p["id"] != incoming["id"]
+            ]
+
+            team["bench"].append(
+                outgoing
+            )
+
+            outgoing["isBench"] = True
+
+            team["substitutionsUsed"] += 1
+
+            if self.ball["owner"] == outgoing["id"]:
+
+                replacement = incoming
+
+                self._give_ball(
+                    replacement,
+                    side,
+                )
+
+            self._event(
+                "substitution",
+                f"{team['name']} substituted {outgoing['name']} for {incoming['name']}",
+                side,
+                incoming["id"],
+                extra={
+                    "outgoingId": outgoing["id"],
+                    "incomingId": incoming["id"],
+                    "outgoing": outgoing["name"],
+                    "incoming": incoming["name"],
+                },
+            )
+
+            return self.snapshot()
+
+    # ========================================================
+    # EVENT
+    # ========================================================
+
+    def _event(
+        self,
+        event_type: str,
+        message: str,
+        side: Optional[str],
+        player_id: Optional[str],
+        extra: Optional[Dict[str, Any]] = None,
+    ):
+
+        event = {
+            "id": str(uuid.uuid4()),
+            "type": event_type,
+            "minute": self.minute,
+            "second": self.second,
+            "message": message,
+            "side": side,
+            "playerId": player_id,
+            "timestamp": int(
+                time.time() * 1000
+            ),
+        }
+
+        if extra:
+            event.update(
+                extra
+            )
+
+        self.events.append(
+            event
+        )
+
+        if len(self.events) > MAX_EVENTS:
+            self.events = self.events[
+                -MAX_EVENTS:
+            ]
+
+    # ========================================================
+    # TEAM HELPERS
+    # ========================================================
+
+    def _team(
+        self,
+        side: str,
+    ):
+
+        return (
             self.home
             if side == "home"
             else self.away
         )
 
-        if team["substitutionsUsed"] >= 5:
-            return self.snapshot()
-
-        outgoing = self._find_player(
-            team,
-            outgoing_id,
-        )
-
-        incoming = next(
-            (
-                p
-                for p in team["bench"]
-                if p["id"] == incoming_id
-            ),
-            None,
-        )
-
-        if not outgoing or not incoming:
-            return self.snapshot()
-
-        incoming["x"] = outgoing["x"]
-        incoming["y"] = outgoing["y"]
-        incoming["targetX"] = outgoing["targetX"]
-        incoming["targetY"] = outgoing["targetY"]
-        incoming["position"] = outgoing["position"]
-        incoming["role"] = outgoing["role"]
-
-        team["players"].remove(
-            outgoing
-        )
-
-        team["players"].append(
-            incoming
-        )
-
-        team["bench"].remove(
-            incoming
-        )
-
-        team["bench"].append(
-            outgoing
-        )
-
-        team["substitutionsUsed"] += 1
-
-        self._event(
-            self.minute,
-            "substitution",
-            f"{team['name']} made a substitution",
-            side,
-            outgoing["id"],
-            incoming["id"],
-        )
-
-        return self.snapshot()
-
-    # ---------------------------------------------------------
-    # STATS
-    # ---------------------------------------------------------
-
-    def _update_possession_stats(self):
-        side = self.ball.get(
-            "ownerSide"
-        )
-
-        if side == "home":
-            self.stats["home"]["possession"] = 51
-            self.stats["away"]["possession"] = 49
-
-        elif side == "away":
-            self.stats["home"]["possession"] = 49
-            self.stats["away"]["possession"] = 51
-
-    # ---------------------------------------------------------
-    # EVENTS
-    # ---------------------------------------------------------
-
-    def _event(
+    def _team_stats(
         self,
-        minute,
-        event_type,
-        text,
-        side=None,
-        player_id=None,
-        target_id=None,
+        side: str,
     ):
-        event = {
-            "id": f"{self.match_id}-{len(self.events) + 1}",
-            "minute": int(minute),
-            "second": int(self.second),
-            "type": event_type,
-            "text": text,
-            "side": side,
-            "playerId": player_id,
-            "targetId": target_id,
-        }
 
-        self.events.append(event)
+        return self.stats[
+            "home"
+            if side == "home"
+            else "away"
+        ]
 
-        if len(self.events) > 300:
-            self.events = self.events[-300:]
-
-    # ---------------------------------------------------------
+    # ========================================================
     # SNAPSHOT
-    # ---------------------------------------------------------
+    # ========================================================
 
     def snapshot(self):
+
         with self.lock:
+
             return {
+                "ok": True,
+
                 "matchId": self.match_id,
+
                 "status": self.status,
+
+                "running": self.running,
+
+                "finished": self.finished,
+
                 "minute": self.minute,
+
                 "second": self.second,
-                "score": dict(self.score),
-                "home": self._team_snapshot(
+
+                "score": {
+                    "home": self.score["home"],
+                    "away": self.score["away"],
+                },
+
+                "ball": {
+                    "x": round(
+                        self.ball["x"],
+                        2,
+                    ),
+                    "y": round(
+                        self.ball["y"],
+                        2,
+                    ),
+                    "owner": self.ball[
+                        "owner"
+                    ],
+                    "team": self.ball[
+                        "team"
+                    ],
+                    "state": self.ball[
+                        "state"
+                    ],
+                },
+
+                "home": self._serialize_team(
                     self.home
                 ),
-                "away": self._team_snapshot(
+
+                "away": self._serialize_team(
                     self.away
                 ),
-                "ball": dict(self.ball),
-                "events": list(self.events),
-                "stats": {
-                    "home": dict(
-                        self.stats["home"]
-                    ),
-                    "away": dict(
-                        self.stats["away"]
-                    ),
-                },
+
+                "stats": self.stats,
+
+                "events": self.events[
+                    -MAX_EVENTS:
+                ],
+
+                "lastEvent": (
+                    self.events[-1]
+                    if self.events
+                    else None
+                ),
             }
 
-    def _team_snapshot(self, team):
+    # ========================================================
+    # SERIALIZE TEAM
+    # ========================================================
+
+    def _serialize_team(
+        self,
+        team: Dict[str, Any],
+    ):
+
         return {
             "id": team["id"],
             "name": team["name"],
             "logo": team["logo"],
+            "side": team["side"],
             "formation": team["formation"],
-            "tactics": dict(
-                team["tactics"]
-            ),
+            "tactics": team["tactics"],
             "substitutionsUsed": team[
                 "substitutionsUsed"
             ],
-            "stats": dict(
-                team["stats"]
-            ),
+
             "players": [
-                dict(player)
-                for player in team["players"]
+                self._serialize_player(
+                    p
+                )
+                for p in team["players"]
             ],
+
             "bench": [
-                dict(player)
-                for player in team["bench"]
+                self._serialize_player(
+                    p
+                )
+                for p in team["bench"]
+            ],
+
+            "stats": team["stats"],
+        }
+
+    def _serialize_player(
+        self,
+        player: Dict[str, Any],
+    ):
+
+        return {
+            "id": player["id"],
+            "name": player["name"],
+            "number": player["number"],
+            "position": player["position"],
+            "role": player["role"],
+            "side": player["side"],
+            "active": player["active"],
+
+            "pace": round(
+                player["pace"],
+                1,
+            ),
+
+            "passing": round(
+                player["passing"],
+                1,
+            ),
+
+            "shooting": round(
+                player["shooting"],
+                1,
+            ),
+
+            "dribbling": round(
+                player["dribbling"],
+                1,
+            ),
+
+            "defending": round(
+                player["defending"],
+                1,
+            ),
+
+            "stamina": round(
+                player["stamina"],
+                1,
+            ),
+
+            "strength": round(
+                player["strength"],
+                1,
+            ),
+
+            "vision": round(
+                player["vision"],
+                1,
+            ),
+
+            "goalkeeping": round(
+                player["goalkeeping"],
+                1,
+            ),
+
+            "energy": round(
+                player["energy"],
+                1,
+            ),
+
+            "x": round(
+                player["x"],
+                2,
+            ),
+
+            "y": round(
+                player["y"],
+                2,
+            ),
+
+            "targetX": round(
+                player["targetX"],
+                2,
+            ),
+
+            "targetY": round(
+                player["targetY"],
+                2,
+            ),
+
+            "hasBall": player[
+                "hasBall"
+            ],
+
+            "action": player[
+                "action"
+            ],
+
+            "stats": player[
+                "stats"
             ],
         }
+
+
+# ============================================================
+# COMPATIBILITY ALIAS
+# ============================================================
+
+# Some older frontend files may import FootballEngine
+# instead of FootballMatch. This prevents unnecessary
+# import errors.
+FootballEngine = FootballMatch
