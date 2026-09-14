@@ -7,10 +7,9 @@ from football_engine import FootballMatch
 
 
 app = FastAPI(
-    title="Virtual Football Manager Engine",
-    version="1.2.0",
+    title="Virtual Football Manager Match Engine",
+    version="3.0.0",
 )
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +23,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 matches: dict[str, FootballMatch] = {}
 
 
@@ -32,8 +30,9 @@ matches: dict[str, FootballMatch] = {}
 def root():
     return {
         "ok": True,
-        "service": "Virtual Football Manager Python Engine",
-        "version": "1.2.0",
+        "service": "Virtual Football Manager Match Engine",
+        "version": "3.0.0",
+        "matches": len(matches),
     }
 
 
@@ -42,6 +41,7 @@ def health():
     return {
         "ok": True,
         "service": "football-engine",
+        "version": "3.0.0",
         "matches": len(matches),
     }
 
@@ -49,7 +49,9 @@ def health():
 @app.post("/match/create")
 def create_match(config: dict[str, Any]):
     match_id = str(
-        config.get("matchId", "")
+        config.get("matchId")
+        or config.get("id")
+        or ""
     ).strip()
 
     if not match_id:
@@ -64,7 +66,6 @@ def create_match(config: dict[str, Any]):
     try:
         match = FootballMatch(config)
         matches[match_id] = match
-
         return match.snapshot()
 
     except Exception as exc:
@@ -101,7 +102,7 @@ def pause_match(match_id: str):
 
 
 @app.get("/match/{match_id}/state")
-def match_state(match_id: str):
+def get_match_state(match_id: str):
     match = matches.get(match_id)
 
     if not match:
@@ -111,6 +112,19 @@ def match_state(match_id: str):
         )
 
     return match.snapshot()
+
+
+@app.post("/match/{match_id}/finish")
+def finish_match(match_id: str):
+    match = matches.get(match_id)
+
+    if not match:
+        raise HTTPException(
+            status_code=404,
+            detail="Match not found",
+        )
+
+    return match.finish()
 
 
 @app.post("/match/{match_id}/tactics")
@@ -126,12 +140,9 @@ def update_tactics(
             detail="Match not found",
         )
 
-    side = body.get("side", "home")
-    tactics = body.get("tactics", {})
-
     return match.set_tactics(
-        side,
-        tactics,
+        body.get("side", "home"),
+        body.get("tactics", {}),
     )
 
 
@@ -148,18 +159,9 @@ def update_formation(
             detail="Match not found",
         )
 
-    side = body.get("side", "home")
-    formation = body.get("formation")
-
-    if not formation:
-        raise HTTPException(
-            status_code=400,
-            detail="formation is required",
-        )
-
     return match.set_formation(
-        side,
-        formation,
+        body.get("side", "home"),
+        body.get("formation", "4-3-3"),
     )
 
 
@@ -176,34 +178,11 @@ def substitute(
             detail="Match not found",
         )
 
-    side = body.get("side", "home")
-    outgoing_id = body.get("outgoingId")
-    incoming_id = body.get("incomingId")
-
-    if not outgoing_id or not incoming_id:
-        raise HTTPException(
-            status_code=400,
-            detail="outgoingId and incomingId are required",
-        )
-
     return match.substitute(
-        side,
-        outgoing_id,
-        incoming_id,
+        body.get("side", "home"),
+        body.get("outgoingId"),
+        body.get("incomingId"),
     )
-
-
-@app.post("/match/{match_id}/finish")
-def finish_match(match_id: str):
-    match = matches.get(match_id)
-
-    if not match:
-        raise HTTPException(
-            status_code=404,
-            detail="Match not found",
-        )
-
-    return match.finish()
 
 
 @app.delete("/match/{match_id}")
